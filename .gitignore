@@ -10,3 +10,6 @@ __pycache__/
 # Large generated files (rebuild with prepare_data.py)
 results/diagnostic_table.csv
 results/.Rhistory
+
+# Daily pipeline logs (auto-generated, not version-controlled)
+logs/*.log

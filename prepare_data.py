@@ -7,7 +7,7 @@ Run after data_loading.py completes (~3:07 PM).
 Reads master_data/*.parquet. Outputs:
   results/diagnostic_table.csv          — every market-cap-eligible symbol/day,
                                           all conditions visible, pass/fail flags
-  results/trade_list_YYYY-MM-DD.csv     — TODAY's signals only (all 4 conditions
+  results/trade_list_YYYY-MM-DD.csv     — TODAY's signals only (3 conditions
                                           pass) — the live "buy these at 3:15pm" list
 
 Signal conditions (all 4 must pass):
@@ -437,7 +437,7 @@ def build_diagnostic_table(vol_window=36, vol_mult=6.0,
     full_df["date"] = pd.to_datetime(full_df["date"])
     today_date = pd.Timestamp.today().normalize()
     today_signals = full_df[
-        (full_df["date"] == today_date) & full_df["passes_all_four"]
+        (full_df["date"] == today_date) & full_df["passes_all_three"]
     ].copy()
 
     trade_list_path = RESULTS / f"trade_list_{today_date.date()}.csv"

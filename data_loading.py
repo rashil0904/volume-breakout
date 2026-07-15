@@ -33,7 +33,7 @@ from pathlib import Path
 # ── CONFIG (update ACCESS_TOKEN daily) ───────────────────────────────────────
 ACCESS_TOKEN   = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJEUjEyOTMiLCJqdGkiOiI2YTUxM2I4OGUzNDQ3MjQwMjRmNmQ5ODUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4MzcwODU1MiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE1MjU2ODAwfQ.b2kgnyorOf1XQgIiXyvZmRnu74rmMXlQ7jDbM2G2nHo"
 COMPANIES_CSV  = "Companies List.csv"
-MAX_WORKERS    = 12
+MAX_WORKERS    = 4
 MAX_RETRIES    = 3
 INITIAL_BACKOFF = 2.0
 
@@ -221,7 +221,7 @@ def main():
         print(f"  Unresolved: {', '.join(unresolved[:10])}{'…' if len(unresolved)>10 else ''}")
 
     print(f"\nFetching {len(instruments):,} symbols with {MAX_WORKERS} workers …")
-    print(f"Expected: 4–6 min at 500 req/min rate limit\n")
+    print(f"Expected: 12–18 min at 500 req/min rate limit\n")
 
     tasks       = list(instruments.items())
     no_data     = []
