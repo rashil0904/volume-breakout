@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 """
-prepare_data.py — Build diagnostic_table.csv
-=============================================
-Reads from master_data/<SYMBOL>.parquet (built by data_loading.py).
-Outputs one row per (symbol, trading-day) with BOTH entry price candidates
-and ALL exit-day opens needed by run_backtest.py.
+prepare_data.py — Build diagnostic table + live trade list
+===========================================================
+Run after data_loading.py completes (~3:07 PM).
 
-Signal conditions (evaluated at 3:00 PM each trading day):
-  1. Market cap ₹1,500–5,000 Cr  (closest preceding NSE semi-annual snapshot)
-  2. Cumulative volume 09:15–14:45 ≥ vol_mult × rolling-avg of full-day volume
-       · full-day window 09:15–15:15; zero-vol days excluded; strict min_periods
-  3. OPEN of 15:00 candle ≥ 5% above prev_day_vwap_close
-       · prev_day_vwap_close = VWAP of prev day's 15:00 + 15:15 candles
-         (typical_price = (H+L+C)/3 per candle, weighted by volume)
+Reads master_data/*.parquet. Outputs:
+  results/diagnostic_table.csv          — every market-cap-eligible symbol/day,
+                                          all conditions visible, pass/fail flags
+  results/trade_list_YYYY-MM-DD.csv     — TODAY's signals only (all 4 conditions
+                                          pass) — the live "buy these at 3:15pm" list
+
+Signal conditions (all 4 must pass):
+  1. Market cap ₹1,500–5,000 Cr (nearest preceding NSE semi-annual snapshot)
+  2. Cumulative volume 09:15–14:45 >= vol_mult × N-day rolling avg full-day volume
+       (full-day = 09:15–15:15; zero-vol days excluded; strict min_periods=N)
+  3. OPEN of 15:00 candle >= 5% above prev_day_vwap_close
+       (prev_day_vwap = VWAP of prev day's 15:00+15:15 candles,
+        typical_price = (H+L+C)/3 per candle, volume-weighted)
+  4. Fade-at-entry <= 5% (NO LOOKAHEAD):
+       high_before_entry = MAX(high) from 09:15 through 15:00 inclusive
+                           (15:00 candle closes exactly when 15:15 candle opens
+                            — fully known at entry time, zero lookahead)
+       fade_at_entry_pct = (high_before_entry - entry_price_315pm)
+                           / high_before_entry * 100
+
+Note: entry_price_315pm = OPEN of 15:15 candle (actual execution price).
+      return_pct (condition 3) uses OPEN of 15:00 candle as the fixed
+      reference — unchanged from all prior versions of this project.
 
 CLI:
-  python prepare_data.py [--vol-window 30] [--vol-mult 7] [--output path]
-
-Importable:
-  from prepare_data import build_diagnostic_table
-  df = build_diagnostic_table(vol_window=36, vol_mult=6.0)
+  python prepare_data.py [--vol-window 36] [--vol-mult 6]
 """
 
 import argparse
 import sys
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from bisect import bisect_right
 import time
+from bisect import bisect_right
+from pathlib import Path
 
-BASE      = Path(__file__).parent
+import numpy as np
+import pandas as pd
+
+BASE       = Path(__file__).parent
 MASTER_DIR = BASE / "master_data"
-MDIR      = BASE / "mcap_cache"
-RESULTS   = BASE / "results"
-IST       = "Asia/Kolkata"
+MDIR       = BASE / "mcap_cache"
+RESULTS    = BASE / "results"
+IST        = "Asia/Kolkata"
 
-# HM encoding: hour*60 + minute
 HM_915  = 555   # 09:15
 HM_930  = 570   # 09:30
 HM_945  = 585   # 09:45
@@ -48,9 +58,11 @@ HM_1515 = 915   # 15:15
 
 MCAP_MIN_CR = 1_500
 MCAP_MAX_CR = 5_000
+FADE_LIMIT  = 5.0   # condition 4 threshold (%)
 
-# Cumulative intraday checkpoints (for high/low tracking)
-CHECKPOINTS = [("10", 600), ("11", 660), ("12", 720), ("13", 780), ("14", 840), ("15", 900)]
+# Cumulative intraday high/low checkpoints
+CHECKPOINTS = [("10", 600), ("11", 660), ("12", 720),
+               ("13", 780), ("14", 840), ("15", 900)]
 
 SNAPS = [
     ("2022-03-31", "mcap_2022-03-31.xlsx",  "MCAP31032022_1.xlsx"),
@@ -64,9 +76,7 @@ SNAPS = [
 
 
 def _load_mcap_snapshots():
-    snap_dates    = []
-    snap_eligible = []
-    snap_labels   = []
+    snap_dates, snap_eligible, snap_labels = [], [], []
     for date_str, cache_file, source_file in SNAPS:
         path = MDIR / cache_file
         if not path.exists():
@@ -82,7 +92,7 @@ def _load_mcap_snapshots():
         snap_dates.append(pd.Timestamp(date_str))
         snap_eligible.append(elig_dict)
         snap_labels.append(f"{date_str} ({source_file})")
-        print(f"  {date_str}: {len(df):,} total → {len(elig_dict):,} eligible (₹1,500–5,000 Cr)")
+        print(f"  {date_str}: {len(df):,} total → {len(elig_dict):,} eligible")
     return snap_dates, snap_eligible, snap_labels
 
 
@@ -91,10 +101,9 @@ def get_arr(series_dict, dates, default=np.nan):
 
 
 def shift_next(arr):
-    """shift_next[i] = arr[i+1]; last element = NaN."""
-    out       = np.empty(len(arr), dtype=float)
-    out[-1]   = np.nan
-    out[:-1]  = arr[1:]
+    out = np.empty(len(arr), dtype=float)
+    out[-1]  = np.nan
+    out[:-1] = arr[1:]
     return out
 
 
@@ -105,25 +114,13 @@ def hm_to_time(hm_float):
     return f"{hm//60:02d}:{hm%60:02d}"
 
 
-def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbose=True, save_csv=True):
+def build_diagnostic_table(vol_window=36, vol_mult=6.0,
+                            output_path=None, save_csv=True, verbose=True):
     """
-    Build the diagnostic table from master_data/ parquet files.
+    Build the full diagnostic table from master_data/ parquets.
 
-    Parameters
-    ----------
-    vol_window : int
-        Rolling lookback for full-day volume average (strict min_periods).
-    vol_mult : float
-        Minimum volume ratio threshold for the signal.
-    output_path : str or Path, optional
-        Where to write the CSV. Defaults to results/diagnostic_table.csv.
-    verbose : bool
-        Print progress.
-
-    Returns
-    -------
-    pd.DataFrame
-        The complete diagnostic table (all symbols, all days).
+    Returns pd.DataFrame with one row per (symbol, trading-day).
+    Also writes results/trade_list_YYYY-MM-DD.csv for today's signals.
     """
     RESULTS.mkdir(exist_ok=True)
     out_path = Path(output_path) if output_path else RESULTS / "diagnostic_table.csv"
@@ -131,16 +128,14 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
     if verbose:
         print("=" * 68)
         print(f"prepare_data.py  —  vol_window={vol_window}  vol_mult={vol_mult}x")
-        print(f"Reading from : {MASTER_DIR}/")
-        print(f"Output       : {out_path if save_csv else '(not saved to disk)'}")
+        print(f"Reading  : {MASTER_DIR}/")
+        print(f"Output   : {out_path if save_csv else '(not saved)'}")
         print("=" * 68)
-
-    # ── STEP 1: MCAP snapshots ────────────────────────────────────────────────
-    if verbose:
         print("\nSTEP 1 — Loading MCAP snapshots")
+
     snap_dates, snap_eligible, snap_labels = _load_mcap_snapshots()
 
-    ever_eligible: set = set()
+    ever_eligible = set()
     for ed in snap_eligible:
         ever_eligible.update(ed.keys())
 
@@ -149,21 +144,20 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
     missing       = sorted(ever_eligible - parquet_files.keys())
 
     if verbose:
-        print(f"\nUnique symbols eligible in ≥1 snapshot : {len(ever_eligible)}")
-        print(f"Have parquet data : {len(available)}  |  No parquet : {len(missing)}")
+        print(f"\nEligible in ≥1 snapshot : {len(ever_eligible)}")
+        print(f"Have parquet data        : {len(available)}  |  No parquet: {len(missing)}")
         if missing:
-            print(f"  Missing: {missing[:15]}{'…' if len(missing) > 15 else ''}")
-
-    # ── STEP 2: Build diagnostic rows ─────────────────────────────────────────
-    if verbose:
+            print(f"  Missing: {missing[:10]}{'…' if len(missing)>10 else ''}")
         print(f"\nSTEP 2 — Processing {len(available)} symbols")
         print("=" * 68)
 
-    t0          = time.time()
+    t0         = time.time()
     first_write = True
     total_rows  = 0
-    total_sigs  = 0
+    total_3     = 0   # passes original 3 conditions
+    total_4     = 0   # passes all 4 conditions
     all_chunks  = []
+    today       = pd.Timestamp.today().normalize()
 
     for sym_idx, symbol in enumerate(available):
 
@@ -172,7 +166,7 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
             rate    = sym_idx / elapsed
             eta     = (len(available) - sym_idx) / rate if rate > 0 else 0
             print(f"  [{sym_idx:>4}/{len(available)}]  {total_rows:>9,} rows  "
-                  f"{total_sigs:>5,} signals  ETA {eta:>4.0f}s")
+                  f"{total_3:>5,} sig3  {total_4:>5,} sig4  ETA {eta:>4.0f}s")
 
         try:
             raw = pd.read_parquet(parquet_files[symbol])
@@ -194,15 +188,15 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
         c3_vol = (raw[(raw["hm"] >= HM_915) & (raw["hm"] <= HM_1445)]
                   .groupby("date")["volume"].sum())
 
-        # ── VWAP of last two candles of previous day ──────────────────────────
-        last2      = raw[raw["hm"].isin([HM_1500, HM_1515])].copy()
+        # ── VWAP of previous day's last two candles ───────────────────────────
+        last2 = raw[raw["hm"].isin([HM_1500, HM_1515])].copy()
         last2["tp"]     = (last2["high"] + last2["low"] + last2["close"]) / 3
         last2["tp_vol"] = last2["tp"] * last2["volume"]
-        last2_grp  = last2.groupby("date")[["tp_vol", "volume"]].sum()
-        vwap_raw   = (last2_grp["tp_vol"] / last2_grp["volume"]).where(
-            last2_grp["volume"] > 0, np.nan)
+        last2_grp = last2.groupby("date")[["tp_vol", "volume"]].sum()
+        vwap_raw  = (last2_grp["tp_vol"] / last2_grp["volume"]).where(
+                        last2_grp["volume"] > 0, np.nan)
 
-        # ── 15:00 open ────────────────────────────────────────────────────────
+        # ── 15:00 open (return condition reference price) ─────────────────────
         pm3_raw = raw[raw["hm"] == HM_1500].groupby("date")["open"].last()
 
         n        = len(all_dates)
@@ -211,10 +205,7 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
         pm3_arr  = np.array([pm3_raw.get(d, np.nan) for d in all_dates], dtype=float)
         vwap_arr = np.array([vwap_raw.get(d, np.nan) for d in all_dates], dtype=float)
 
-        # Rolling vol average: computed only over non-zero-volume trading days so that
-        # zero-volume holidays (e.g. Diwali Muhurat) don't create NaN cascades.
-        # shift(1) by position means each day uses the previous non-zero-volume day's window.
-        # reindex+ffill maps the result back to all calendar dates in all_dates.
+        # Rolling volume average — non-zero days only, ffill across holidays
         _fd_nonzero = pd.Series(fd_arr, index=all_dates)[fd_arr > 0]
         avg_arr = (
             _fd_nonzero
@@ -225,10 +216,10 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
             .values
         )
 
-        prev_vwap_arr      = np.empty(n, dtype=float); prev_vwap_arr[0]  = np.nan
-        prev_vwap_arr[1:]  = vwap_arr[:-1]
-        next_pm3_arr       = np.empty(n, dtype=float); next_pm3_arr[-1]  = np.nan
-        next_pm3_arr[:-1]  = pm3_arr[1:]
+        prev_vwap_arr     = np.empty(n, dtype=float); prev_vwap_arr[0]  = np.nan
+        prev_vwap_arr[1:] = vwap_arr[:-1]
+        next_pm3_arr      = np.empty(n, dtype=float); next_pm3_arr[-1]  = np.nan
+        next_pm3_arr[:-1] = pm3_arr[1:]
 
         prev_d_list = [None] + list(all_dates[:-1])
         ts_dates    = [pd.Timestamp(d) for d in all_dates]
@@ -239,21 +230,21 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
         # ── Full intraday candle set ───────────────────────────────────────────
         full = raw[(raw["hm"] >= HM_915) & (raw["hm"] <= HM_1515)].copy()
 
-        o915   = full[full["hm"] == HM_915 ].groupby("date")["open" ].last()
-        c915   = full[full["hm"] == HM_915 ].groupby("date")["close"].last()
-        o930   = full[full["hm"] == HM_930 ].groupby("date")["open" ].last()
-        o945   = full[full["hm"] == HM_945 ].groupby("date")["open" ].last()
-        o1100  = full[full["hm"] == HM_1100].groupby("date")["open" ].last()
-        o1430  = full[full["hm"] == HM_1430].groupby("date")["open" ].last()
-        o1445  = full[full["hm"] == HM_1445].groupby("date")["open" ].last()
-        o1515  = full[full["hm"] == HM_1515].groupby("date")["open" ].last()
-        c1515  = full[full["hm"] == HM_1515].groupby("date")["close"].last()
+        o915  = full[full["hm"] == HM_915 ].groupby("date")["open" ].last()
+        c915  = full[full["hm"] == HM_915 ].groupby("date")["close"].last()
+        o930  = full[full["hm"] == HM_930 ].groupby("date")["open" ].last()
+        o945  = full[full["hm"] == HM_945 ].groupby("date")["open" ].last()
+        o1100 = full[full["hm"] == HM_1100].groupby("date")["open" ].last()
+        o1430 = full[full["hm"] == HM_1430].groupby("date")["open" ].last()
+        o1445 = full[full["hm"] == HM_1445].groupby("date")["open" ].last()
+        o1515 = full[full["hm"] == HM_1515].groupby("date")["open" ].last()
+        c1515 = full[full["hm"] == HM_1515].groupby("date")["close"].last()
 
         dh = full.groupby("date")["high"  ].max()
         dl = full.groupby("date")["low"   ].min()
         dv = full.groupby("date")["volume"].sum()
 
-        sorted_f      = full.sort_values(["date", "hm"]).copy()
+        sorted_f       = full.sort_values(["date", "hm"]).copy()
         sorted_f["_dh"] = sorted_f.groupby("date")["high"].transform("max")
         sorted_f["_dl"] = sorted_f.groupby("date")["low" ].transform("min")
         hm_high = (sorted_f[sorted_f["high"] == sorted_f["_dh"]]
@@ -266,35 +257,35 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
         cumhigh = {tag: full[full["hm"] <= mhm].groupby("date")["high"].max()
                    for tag, mhm in CHECKPOINTS}
 
-        o915_arr   = get_arr(o915,   all_dates)
-        c915_arr   = get_arr(c915,   all_dates)
-        o930_arr   = get_arr(o930,   all_dates)
-        o945_arr   = get_arr(o945,   all_dates)
-        o1100_arr  = get_arr(o1100,  all_dates)
-        o1430_arr  = get_arr(o1430,  all_dates)
-        o1445_arr  = get_arr(o1445,  all_dates)
-        o1515_arr  = get_arr(o1515,  all_dates)
-        c1515_arr  = get_arr(c1515,  all_dates)
-        dh_arr     = get_arr(dh,     all_dates)
-        dl_arr     = get_arr(dl,     all_dates)
-        dv_arr     = get_arr(dv,     all_dates, default=0)
+        o915_arr  = get_arr(o915,  all_dates)
+        c915_arr  = get_arr(c915,  all_dates)
+        o930_arr  = get_arr(o930,  all_dates)
+        o945_arr  = get_arr(o945,  all_dates)
+        o1100_arr = get_arr(o1100, all_dates)
+        o1430_arr = get_arr(o1430, all_dates)
+        o1445_arr = get_arr(o1445, all_dates)
+        o1515_arr = get_arr(o1515, all_dates)
+        c1515_arr = get_arr(c1515, all_dates)
+        dh_arr    = get_arr(dh,    all_dates)
+        dl_arr    = get_arr(dl,    all_dates)
+        dv_arr    = get_arr(dv,    all_dates, default=0)
         hm_high_arr = get_arr(hm_high, all_dates)
         hm_low_arr  = get_arr(hm_low,  all_dates)
 
         cumlow_arrs  = {tag: get_arr(cumlow[tag],  all_dates) for tag, _ in CHECKPOINTS}
         cumhigh_arrs = {tag: get_arr(cumhigh[tag], all_dates) for tag, _ in CHECKPOINTS}
 
-        nd_o915_arr    = shift_next(o915_arr)
-        nd_c915_arr    = shift_next(c915_arr)
-        nd_o930_arr    = shift_next(o930_arr)
-        nd_o945_arr    = shift_next(o945_arr)
-        nd_o1100_arr   = shift_next(o1100_arr)
-        nd_o1430_arr   = shift_next(o1430_arr)
-        nd_o1445_arr   = shift_next(o1445_arr)
-        nd_c1515_arr   = shift_next(c1515_arr)
-        nd_dh_arr      = shift_next(dh_arr)
-        nd_dl_arr      = shift_next(dl_arr)
-        nd_dv_arr      = shift_next(dv_arr)
+        nd_o915_arr  = shift_next(o915_arr)
+        nd_c915_arr  = shift_next(c915_arr)
+        nd_o930_arr  = shift_next(o930_arr)
+        nd_o945_arr  = shift_next(o945_arr)
+        nd_o1100_arr = shift_next(o1100_arr)
+        nd_o1430_arr = shift_next(o1430_arr)
+        nd_o1445_arr = shift_next(o1445_arr)
+        nd_c1515_arr = shift_next(c1515_arr)
+        nd_dh_arr    = shift_next(dh_arr)
+        nd_dl_arr    = shift_next(dl_arr)
+        nd_dv_arr    = shift_next(dv_arr)
         nd_hm_high_arr = shift_next(hm_high_arr)
         nd_hm_low_arr  = shift_next(hm_low_arr)
         nd_cumlow_arrs  = {tag: shift_next(arr) for tag, arr in cumlow_arrs.items()}
@@ -302,34 +293,33 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
 
         # ── Assemble per-symbol DataFrame ─────────────────────────────────────
         sym_df = pd.DataFrame({
-            "date":           all_dates,
-            "snap_idx":       snap_idxs,
-            "mcap_cr":        mcap_arr,
-            "prev_date":      prev_d_list,
+            "date":            all_dates,
+            "snap_idx":        snap_idxs,
+            "mcap_cr":         mcap_arr,
+            "prev_date":       prev_d_list,
             "prev_vwap_close": prev_vwap_arr,
-            "pm3_open":       pm3_arr,
-            "next_pm3_open":  next_pm3_arr,
-            "cum_vol":        c3_arr,
-            "avg_vol":        avg_arr,
-            "o915":   o915_arr,   "c915":  c915_arr,
-            "o930":   o930_arr,   "o945":  o945_arr,
-            "o1100":  o1100_arr,  "o1430": o1430_arr,
-            "o1445":  o1445_arr,  "o1515": o1515_arr,  "c1515": c1515_arr,
-            "dh":     dh_arr,     "dl":    dl_arr,      "dv":    dv_arr,
+            "pm3_open":        pm3_arr,
+            "next_pm3_open":   next_pm3_arr,
+            "cum_vol":         c3_arr,
+            "avg_vol":         avg_arr,
+            "o915":   o915_arr,   "c915":   c915_arr,
+            "o930":   o930_arr,   "o945":   o945_arr,
+            "o1100":  o1100_arr,  "o1430":  o1430_arr,
+            "o1445":  o1445_arr,  "o1515":  o1515_arr,  "c1515": c1515_arr,
+            "dh":     dh_arr,     "dl":     dl_arr,      "dv":   dv_arr,
             "hm_high": hm_high_arr, "hm_low": hm_low_arr,
             **{f"cumlow_{t}":  cumlow_arrs[t]  for t, _ in CHECKPOINTS},
             **{f"cumhigh_{t}": cumhigh_arrs[t] for t, _ in CHECKPOINTS},
-            "nd_o915":    nd_o915_arr,   "nd_c915":   nd_c915_arr,
-            "nd_o930":    nd_o930_arr,   "nd_o945":   nd_o945_arr,
-            "nd_o1100":   nd_o1100_arr,  "nd_o1430":  nd_o1430_arr,
-            "nd_o1445":   nd_o1445_arr,  "nd_c1515":  nd_c1515_arr,
-            "nd_dh":      nd_dh_arr,     "nd_dl":     nd_dl_arr,   "nd_dv": nd_dv_arr,
+            "nd_o915":    nd_o915_arr,   "nd_c915":  nd_c915_arr,
+            "nd_o930":    nd_o930_arr,   "nd_o945":  nd_o945_arr,
+            "nd_o1100":   nd_o1100_arr,  "nd_o1430": nd_o1430_arr,
+            "nd_o1445":   nd_o1445_arr,  "nd_c1515": nd_c1515_arr,
+            "nd_dh":      nd_dh_arr,     "nd_dl":    nd_dl_arr,   "nd_dv": nd_dv_arr,
             "nd_hm_high": nd_hm_high_arr, "nd_hm_low": nd_hm_low_arr,
             **{f"nd_cumlow_{t}":  nd_cumlow_arrs[t]  for t, _ in CHECKPOINTS},
             **{f"nd_cumhigh_{t}": nd_cumhigh_arrs[t] for t, _ in CHECKPOINTS},
         })
 
-        # Drop first vol_window rows (rolling avg not yet valid) and rows with no mcap
         sym_df = sym_df.iloc[vol_window:].copy()
         sym_df = sym_df[sym_df["mcap_cr"].notna()].copy()
         if sym_df.empty:
@@ -337,18 +327,30 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
 
         # ── Signal criteria ───────────────────────────────────────────────────
         with np.errstate(invalid="ignore", divide="ignore"):
+            # Conditions 2 & 3 (unchanged throughout project)
+            vol_arr = sym_df["cum_vol"].values / sym_df["avg_vol"].values
             ret_arr = ((sym_df["pm3_open"].values - sym_df["prev_vwap_close"].values)
                        / sym_df["prev_vwap_close"].values * 100)
-            vol_arr = sym_df["cum_vol"].values / sym_df["avg_vol"].values
 
-        passes_vol = np.where(np.isnan(vol_arr), False, vol_arr >= vol_mult)
-        passes_ret = np.where(np.isnan(ret_arr), False, ret_arr >= 5.0)
-        passes_all = passes_vol & passes_ret
+            # Condition 4: fade at entry (no lookahead — 15:00 candle closes
+            # exactly when 15:15 entry candle opens)
+            fade_arr = np.where(
+                sym_df["cumhigh_15"].values > 0,
+                (sym_df["cumhigh_15"].values - sym_df["o1515"].values)
+                / sym_df["cumhigh_15"].values * 100,
+                np.nan,
+            )
 
-        hm_high_vals    = sym_df["hm_high"].values
-        hm_low_vals     = sym_df["hm_low"].values
-        nd_hm_high_vals = sym_df["nd_hm_high"].values
-        nd_hm_low_vals  = sym_df["nd_hm_low"].values
+        passes_vol    = np.where(np.isnan(vol_arr),  False, vol_arr  >= vol_mult)
+        passes_ret    = np.where(np.isnan(ret_arr),  False, ret_arr  >= 5.0)
+        passes_fade   = np.where(np.isnan(fade_arr), False, fade_arr <= FADE_LIMIT)
+        passes_three  = passes_vol & passes_ret          # original 3 conditions
+        passes_four   = passes_three & passes_fade       # all 4 conditions
+
+        hm_high_vals     = sym_df["hm_high"].values
+        hm_low_vals      = sym_df["hm_low"].values
+        nd_hm_high_vals  = sym_df["nd_hm_high"].values
+        nd_hm_low_vals   = sym_df["nd_hm_low"].values
 
         # ── Build output rows ─────────────────────────────────────────────────
         out_df = pd.DataFrame({
@@ -358,24 +360,28 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
             "market_cap_value":          np.round(sym_df["mcap_cr"].values, 2),
             "prev_trading_day":          sym_df["prev_date"].values,
             "prev_day_vwap_close":       np.round(sym_df["prev_vwap_close"].values, 4),
-            # Entry price candidates
+            # Entry prices
             "entry_price_3pm":           np.round(sym_df["pm3_open"].values, 4),
             "entry_price_315pm":         np.round(sym_df["o1515"].values, 4),
             # Signal diagnostics
             "return_pct_vs_prev_close":  np.round(ret_arr, 6),
             "cum_volume_to_3pm_today":   sym_df["cum_vol"].values.astype(np.int64),
-            "avg_30day_fullday_volume":  np.round(sym_df["avg_vol"].values, 2),
+            "avg_nday_fullday_volume":   np.round(sym_df["avg_vol"].values, 2),
             "volume_ratio":              np.round(vol_arr, 6),
+            "fade_at_entry_pct":         np.round(fade_arr, 4),
+            # Condition pass/fail flags
             "passes_volume":             passes_vol,
             "passes_return":             passes_ret,
-            "passes_all_three":          passes_all,
-            # Exit prices — standard single exits
+            "passes_fade":               passes_fade,
+            "passes_all_three":          passes_three,   # conditions 1+2+3 (mcap implicit)
+            "passes_all_four":           passes_four,    # + condition 4 (fade)
+            # Exit prices
             "exit_3pm_open":             np.round(sym_df["next_pm3_open"].values, 4),
             "exit_945_open":             np.round(sym_df["nd_o945"].values, 4),
             "exit_1100_open":            np.round(sym_df["nd_o1100"].values, 4),
             "exit_1430_open":            np.round(sym_df["nd_o1430"].values, 4),
             "exit_1445_open":            np.round(sym_df["nd_o1445"].values, 4),
-            # Enriched entry-day columns
+            # Entry-day enriched columns
             "today_open_915":            np.round(sym_df["o915"].values,  4),
             "today_close_1515":          np.round(sym_df["c1515"].values, 4),
             "today_high":                np.round(sym_df["dh"].values,    4),
@@ -383,48 +389,32 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
             "today_low":                 np.round(sym_df["dl"].values,    4),
             "today_low_time":            [hm_to_time(v) for v in hm_low_vals],
             "today_fullday_vol":         sym_df["dv"].values.astype(np.int64),
-            "today_cumlow_10":           np.round(sym_df["cumlow_10"].values,  4),
-            "today_cumlow_11":           np.round(sym_df["cumlow_11"].values,  4),
-            "today_cumlow_12":           np.round(sym_df["cumlow_12"].values,  4),
-            "today_cumlow_13":           np.round(sym_df["cumlow_13"].values,  4),
-            "today_cumlow_14":           np.round(sym_df["cumlow_14"].values,  4),
-            "today_cumlow_15":           np.round(sym_df["cumlow_15"].values,  4),
-            "today_cumhigh_10":          np.round(sym_df["cumhigh_10"].values, 4),
-            "today_cumhigh_11":          np.round(sym_df["cumhigh_11"].values, 4),
-            "today_cumhigh_12":          np.round(sym_df["cumhigh_12"].values, 4),
-            "today_cumhigh_13":          np.round(sym_df["cumhigh_13"].values, 4),
-            "today_cumhigh_14":          np.round(sym_df["cumhigh_14"].values, 4),
             "today_cumhigh_15":          np.round(sym_df["cumhigh_15"].values, 4),
-            # Enriched exit-day columns
-            "next_day_915_close":        np.round(sym_df["nd_c915"].values,   4),
-            "next_day_930_open":         np.round(sym_df["nd_o930"].values,   4),
-            "next_day_open_915":         np.round(sym_df["nd_o915"].values,   4),
-            "next_day_close_1515":       np.round(sym_df["nd_c1515"].values,  4),
-            "next_day_high":             np.round(sym_df["nd_dh"].values,     4),
+            **{f"today_cumlow_{t}":  np.round(sym_df[f"cumlow_{t}"].values,  4) for t, _ in CHECKPOINTS},
+            **{f"today_cumhigh_{t}": np.round(sym_df[f"cumhigh_{t}"].values, 4) for t, _ in CHECKPOINTS},
+            # Exit-day enriched columns
+            "next_day_915_close":        np.round(sym_df["nd_c915"].values,  4),
+            "next_day_930_open":         np.round(sym_df["nd_o930"].values,  4),
+            "next_day_open_915":         np.round(sym_df["nd_o915"].values,  4),
+            "next_day_close_1515":       np.round(sym_df["nd_c1515"].values, 4),
+            "next_day_high":             np.round(sym_df["nd_dh"].values,    4),
             "next_day_high_time":        [hm_to_time(v) for v in nd_hm_high_vals],
-            "next_day_low":              np.round(sym_df["nd_dl"].values,     4),
+            "next_day_low":              np.round(sym_df["nd_dl"].values,    4),
             "next_day_low_time":         [hm_to_time(v) for v in nd_hm_low_vals],
-            "next_day_fullday_vol":      np.where(np.isnan(sym_df["nd_dv"].values), 0, sym_df["nd_dv"].values).astype(np.int64),
-            "next_day_cumlow_10":        np.round(sym_df["nd_cumlow_10"].values,  4),
-            "next_day_cumlow_11":        np.round(sym_df["nd_cumlow_11"].values,  4),
-            "next_day_cumlow_12":        np.round(sym_df["nd_cumlow_12"].values,  4),
-            "next_day_cumlow_13":        np.round(sym_df["nd_cumlow_13"].values,  4),
-            "next_day_cumlow_14":        np.round(sym_df["nd_cumlow_14"].values,  4),
-            "next_day_cumlow_15":        np.round(sym_df["nd_cumlow_15"].values,  4),
-            "next_day_cumhigh_10":       np.round(sym_df["nd_cumhigh_10"].values, 4),
-            "next_day_cumhigh_11":       np.round(sym_df["nd_cumhigh_11"].values, 4),
-            "next_day_cumhigh_12":       np.round(sym_df["nd_cumhigh_12"].values, 4),
-            "next_day_cumhigh_13":       np.round(sym_df["nd_cumhigh_13"].values, 4),
-            "next_day_cumhigh_14":       np.round(sym_df["nd_cumhigh_14"].values, 4),
-            "next_day_cumhigh_15":       np.round(sym_df["nd_cumhigh_15"].values, 4),
+            "next_day_fullday_vol":      np.where(np.isnan(sym_df["nd_dv"].values), 0,
+                                                  sym_df["nd_dv"].values).astype(np.int64),
+            **{f"next_day_cumlow_{t}":  np.round(sym_df[f"nd_cumlow_{t}"].values,  4) for t, _ in CHECKPOINTS},
+            **{f"next_day_cumhigh_{t}": np.round(sym_df[f"nd_cumhigh_{t}"].values, 4) for t, _ in CHECKPOINTS},
         })
 
         if save_csv:
             out_df.to_csv(out_path, mode="w" if first_write else "a",
                           header=first_write, index=False)
             first_write = False
-        total_rows  += len(out_df)
-        total_sigs  += int(passes_all.sum())
+
+        total_rows += len(out_df)
+        total_3    += int(passes_three.sum())
+        total_4    += int(passes_four.sum())
         all_chunks.append(out_df)
 
     elapsed = time.time() - t0
@@ -432,32 +422,48 @@ def build_diagnostic_table(vol_window=30, vol_mult=7.0, output_path=None, verbos
         print()
         print("=" * 68)
         print(f"DONE  {elapsed:.1f}s  ({elapsed/60:.1f} min)")
-        print(f"  Total rows        : {total_rows:>10,}")
-        print(f"  passes_all_three  : {total_sigs:>10,}")
-        print(f"  Symbols processed : {len(available):>10,}")
+        print(f"  Total rows          : {total_rows:>10,}")
+        print(f"  passes_all_three    : {total_3:>10,}  (original 3 conditions)")
+        print(f"  passes_all_four     : {total_4:>10,}  (+ fade ≤5% filter)")
         print(f"  Output: {out_path if save_csv else '(not saved)'}")
         print("=" * 68)
 
-    if all_chunks:
-        return pd.concat(all_chunks, ignore_index=True)
-    return pd.DataFrame()
+    if not all_chunks:
+        return pd.DataFrame()
 
+    full_df = pd.concat(all_chunks, ignore_index=True)
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+    # ── Write today's trade list ──────────────────────────────────────────────
+    full_df["date"] = pd.to_datetime(full_df["date"])
+    today_date = pd.Timestamp.today().normalize()
+    today_signals = full_df[
+        (full_df["date"] == today_date) & full_df["passes_all_four"]
+    ].copy()
+
+    trade_list_path = RESULTS / f"trade_list_{today_date.date()}.csv"
+    cols = ["symbol", "date", "entry_price_315pm", "market_cap_value",
+            "volume_ratio", "return_pct_vs_prev_close", "fade_at_entry_pct"]
+    if not today_signals.empty:
+        today_signals[cols].to_csv(trade_list_path, index=False)
+        print(f"\n  TODAY'S TRADE LIST ({today_date.date()}): "
+              f"{len(today_signals)} signal(s) → {trade_list_path.name}")
+        print(today_signals[cols].to_string(index=False))
+    else:
+        print(f"\n  No signals today ({today_date.date()}) — no trade list written.")
+
+    return full_df
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Build diagnostic_table.csv from master_data/")
-    parser.add_argument("--vol-window", type=int,   default=30,
-                        help="Rolling lookback for volume average (default: 30)")
-    parser.add_argument("--vol-mult",   type=float, default=7.0,
-                        help="Minimum volume ratio threshold (default: 7.0)")
-    parser.add_argument("--output",     type=str,   default=None,
-                        help="Output CSV path (default: results/diagnostic_table.csv)")
+    parser = argparse.ArgumentParser(description="Build diagnostic table + trade list")
+    parser.add_argument("--vol-window", type=int,   default=36)
+    parser.add_argument("--vol-mult",   type=float, default=6.0)
+    parser.add_argument("--output",     type=str,   default=None)
     args = parser.parse_args()
 
     if not any(MASTER_DIR.glob("*.parquet")):
-        print(f"ERROR: No parquet files found in {MASTER_DIR}/")
-        print("Run data_loading.py first to build master_data/.")
+        print(f"ERROR: No parquet files in {MASTER_DIR}/")
+        print("Run data_loading.py first.")
         sys.exit(1)
 
     build_diagnostic_table(

@@ -1,346 +1,455 @@
 #!/usr/bin/env python3
 """
-run_backtest.py — Run all 10 entry × exit combinations from one diagnostic table
-==================================================================================
-Reads results/diagnostic_table.csv (built by prepare_data.py) and runs:
+run_backtest.py — Backtest 3 exit scenarios on LB=36 VM=6 signals
+==================================================================
+Reads results/diagnostic_table.csv (built by prepare_data.py).
+Entry always = 3:15pm (entry_price_315pm).
 
-  ENTRIES (2):    3pm (15:00 open)  |  3:15pm (15:15 open)
-  EXITS   (5):    split 9:45+11am   |  3pm   |  2:30pm  |  2:45pm  |  3pm*
-                  (* 3pm repeated so the 2:30/2:45/3pm comparison sits in one block)
+Scenarios:
+  1. Standard    — 100% exit at next-day 3:00pm open
+  2. Split       — 50% at next-day 9:45am open + 50% at next-day 11:00am open
+  3. Split+SL    — 50% at next-day 9:45am open (fixed)
+                   remaining 50% protected by 5% stop-loss from entry_price:
+                     sl_price = entry_price * 0.95
+                   Scan candle lows from 15:15 entry day → next-day 15:00:
+                     if low <= sl_price → exit at sl_price (zero slippage)
+                     else              → exit at next-day 3:00pm open
 
-  = 10 result rows in summary, 8 unique trade files in results/
+Position sizing: ≤5 signals/day → ₹1L each; ≥6 → ₹5L ÷ n. Whole shares.
+No compounding anywhere. Returns are non-compounding daily-weighted sums.
 
-Position sizing (unchanged across all combinations):
-  ≤5 signals/day → ₹1,00,000 per stock (≤₹5L total)
-  6+ signals/day → ₹5,00,000 ÷ n per stock
-  shares = floor(target ÷ entry_price); zero-share trades excluded
+Max drawdown: one continuous equity curve (base ₹5L) across the full period,
+never reset — a reset would understate multi-day losing streaks.
 
-Returns (non-compounding):
-  daily_return_pct = sum(pnl) / sum(capital) × 100 per day
-  total_return     = arithmetic sum of all daily_return_pct values
+Outputs:
+  results/backtest_results.xlsx   — daily/monthly/yearly tables for all 3 scenarios
+  Console summary table
 
-CLI:
-  python run_backtest.py [--diag results/diagnostic_table.csv]
+Usage:
+  python run_backtest.py [--diag results/diagnostic_table.csv] [--three-conditions]
 
-Importable:
-  from run_backtest import run_single_backtest, run_all_combos
-  summary, trades = run_all_combos(diag_df)
+--three-conditions: filter on passes_all_three (original 3 conditions, no fade filter)
+                    Default: passes_all_four (all 4 conditions including fade)
 """
 
 import argparse
-import warnings
-from pathlib import Path
+import sys
+import time
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-warnings.filterwarnings("ignore")
+BASE       = Path(__file__).parent
+MASTER_DIR = BASE / "master_data"
+RESULTS    = BASE / "results"
+IST        = "Asia/Kolkata"
 
-BASE        = Path(__file__).parent
-RESULTS_DIR = BASE / "results"
 DAILY_POOL    = 500_000
 MAX_PER_STOCK = 100_000
+SL_PCT        = 0.05
 
-# ── Combination definitions ───────────────────────────────────────────────────
-# Each tuple: (display_label, entry_col, exit_type, exit_col_or_cols, file_label)
-# exit_type "single": exit_col_or_cols is a string column name
-# exit_type "split":  exit_col_or_cols is (col_945, col_1100)
-COMBOS = [
-    # Entry 3pm
-    ("3pm entry  / split exit (9:45 + 11am)",
-     "entry_price_3pm",   "split",  ("exit_945_open", "exit_1100_open"), "3pm_split"),
-    ("3pm entry  / 3pm exit",
-     "entry_price_3pm",   "single", "exit_3pm_open",                    "3pm_3pm"),
-    ("3pm entry  / 2:30pm exit",
-     "entry_price_3pm",   "single", "exit_1430_open",                   "3pm_230pm"),
-    ("3pm entry  / 2:45pm exit",
-     "entry_price_3pm",   "single", "exit_1445_open",                   "3pm_245pm"),
-    ("3pm entry  / 3pm exit",                         # duplicate row for comparison block
-     "entry_price_3pm",   "single", "exit_3pm_open",                    "3pm_3pm"),
-    # Entry 3:15pm
-    ("3:15pm entry / split exit (9:45 + 11am)",
-     "entry_price_315pm", "split",  ("exit_945_open", "exit_1100_open"), "315pm_split"),
-    ("3:15pm entry / 3pm exit",
-     "entry_price_315pm", "single", "exit_3pm_open",                    "315pm_3pm"),
-    ("3:15pm entry / 2:30pm exit",
-     "entry_price_315pm", "single", "exit_1430_open",                   "315pm_230pm"),
-    ("3:15pm entry / 2:45pm exit",
-     "entry_price_315pm", "single", "exit_1445_open",                   "315pm_245pm"),
-    ("3:15pm entry / 3pm exit",                       # duplicate row for comparison block
-     "entry_price_315pm", "single", "exit_3pm_open",                    "315pm_3pm"),
-]
-
-# Unique combinations to actually compute (dedup on file_label)
-_UNIQUE = {}
-for combo in COMBOS:
-    label = combo[4]
-    if label not in _UNIQUE:
-        _UNIQUE[label] = combo
-UNIQUE_COMBOS = list(_UNIQUE.values())
+HM_915  = 555
+HM_1515 = 915
+HM_1500 = 900
 
 
-# ── Core backtest logic ───────────────────────────────────────────────────────
+# ── Position sizing ───────────────────────────────────────────────────────────
 
-def _get_required_exit_cols(exit_type, exit_col_or_cols):
-    if exit_type == "split":
-        return list(exit_col_or_cols)
-    return [exit_col_or_cols]
+def _day_target(n_signals):
+    return MAX_PER_STOCK if n_signals <= 5 else DAILY_POOL / n_signals
 
 
-def run_single_backtest(signals, entry_col, exit_type, exit_col_or_cols,
-                        daily_pool=DAILY_POOL, max_per_stock=MAX_PER_STOCK):
-    """
-    Run one backtest variant on a filtered signals DataFrame.
+# ── Scenario 1 & 2: pure diagnostic-table backtests ──────────────────────────
 
-    Parameters
-    ----------
-    signals : pd.DataFrame
-        Rows where passes_all_three is True.
-    entry_col : str
-        Column name for entry price.
-    exit_type : str
-        "single" or "split".
-    exit_col_or_cols : str or tuple
-        For "single": column name of exit price.
-        For "split":  (col_945, col_1100) — 50% each, floor/ceil split.
-    daily_pool, max_per_stock : int
-        Position sizing constants.
-
-    Returns
-    -------
-    pd.DataFrame
-        Trade-level log with pnl, capital_allocated, etc.
-    """
-    exit_cols = _get_required_exit_cols(exit_type, exit_col_or_cols)
-
-    # Drop rows missing entry or any required exit price
-    valid = signals.dropna(subset=[entry_col] + exit_cols).copy()
-
+def run_standard(signals):
+    """100% exit at next-day 3pm open."""
+    valid   = signals.dropna(subset=["entry_price_315pm", "exit_3pm_open"]).copy()
     by_date = defaultdict(list)
     for _, row in valid.iterrows():
         by_date[row["date"]].append(row)
 
-    exec_rows = []
+    rows = []
+    for d in sorted(by_date):
+        day = by_date[d]; n = len(day); tgt = _day_target(n)
+        for row in day:
+            ep = float(row["entry_price_315pm"])
+            xp = float(row["exit_3pm_open"])
+            sh = int(tgt // ep)
+            if sh == 0: continue
+            rows.append({
+                "date": d, "symbol": row["symbol"],
+                "entry": ep, "exit": xp, "shares": sh,
+                "pnl": sh * (xp - ep),
+                "ret": (xp - ep) / ep * 100,
+                "cap": sh * ep, "sl_hit": False,
+            })
+    return pd.DataFrame(rows)
 
-    for entry_date in sorted(by_date):
-        day_sigs = by_date[entry_date]
-        n        = len(day_sigs)
-        target   = max_per_stock if n <= 5 else daily_pool / n
 
-        for row in day_sigs:
-            ep     = float(row[entry_col])
-            shares = int(target // ep)
-            if shares == 0:
+def run_split(signals):
+    """50% at 9:45am, 50% at 11:00am."""
+    valid   = signals.dropna(subset=["entry_price_315pm", "exit_945_open", "exit_1100_open"]).copy()
+    by_date = defaultdict(list)
+    for _, row in valid.iterrows():
+        by_date[row["date"]].append(row)
+
+    rows = []
+    for d in sorted(by_date):
+        day = by_date[d]; n = len(day); tgt = _day_target(n)
+        for row in day:
+            ep   = float(row["entry_price_315pm"])
+            x945 = float(row["exit_945_open"])
+            x110 = float(row["exit_1100_open"])
+            sh   = int(tgt // ep)
+            if sh == 0: continue
+            s1   = sh // 2; s2 = sh - s1
+            pnl  = s1 * (x945 - ep) + s2 * (x110 - ep)
+            ret  = 0.5 * (x945 - ep) / ep * 100 + 0.5 * (x110 - ep) / ep * 100
+            rows.append({
+                "date": d, "symbol": row["symbol"],
+                "entry": ep, "exit_945": x945, "exit_1100": x110,
+                "shares": sh, "pnl": pnl, "ret": ret,
+                "cap": sh * ep, "sl_hit": False,
+            })
+    return pd.DataFrame(rows)
+
+
+# ── Scenario 3: Split + 5% SL on second leg ──────────────────────────────────
+
+def run_split_sl(signals):
+    """
+    50% at next-day 9:45am open (fixed).
+    Remaining 50%: 5% SL scanned candle-by-candle from 15:15 entry day
+    through next-day 15:00. If low <= sl_price → exit at sl_price.
+    Otherwise → exit at next-day 3:00pm open.
+    """
+    valid = signals.dropna(subset=["entry_price_315pm", "exit_945_open"]).copy()
+
+    # Group by symbol to load each parquet once
+    sig_by_sym = defaultdict(list)
+    for _, row in valid.iterrows():
+        sig_by_sym[row["symbol"]].append(row)
+
+    all_rows = []
+
+    for symbol, sig_list in sig_by_sym.items():
+        pq = MASTER_DIR / f"{symbol}.parquet"
+        if not pq.exists():
+            continue
+
+        raw = pd.read_parquet(pq)
+        raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True).dt.tz_convert(IST)
+        raw["date"] = raw["timestamp"].dt.date
+        raw["hm"]   = raw["timestamp"].dt.hour * 60 + raw["timestamp"].dt.minute
+        raw = raw.sort_values("timestamp").reset_index(drop=True)
+
+        all_dates = sorted(raw["date"].unique())
+
+        for row in sig_list:
+            entry_date  = pd.Timestamp(row["date"]).date()
+            ep          = float(row["entry_price_315pm"])
+            x945        = float(row["exit_945_open"])
+            sl_price    = ep * (1 - SL_PCT)
+            fallback_3pm = float(row["exit_3pm_open"]) if pd.notna(row.get("exit_3pm_open")) else np.nan
+
+            if np.isnan(x945): continue
+
+            try:
+                idx = all_dates.index(entry_date)
+            except ValueError:
                 continue
+            if idx + 1 >= len(all_dates):
+                continue
+            next_date = all_dates[idx + 1]
 
-            actual_cap = shares * ep
+            # Candles to scan: 15:15 on entry day + all candles on next day up to 15:00
+            scan = raw[
+                ((raw["date"] == entry_date) & (raw["hm"] >= HM_1515)) |
+                ((raw["date"] == next_date)  & (raw["hm"] <= HM_1500))
+            ].sort_values("timestamp")
 
-            if exit_type == "split":
-                col_945, col_1100   = exit_col_or_cols
-                x945                = float(row[col_945])
-                x1100               = float(row[col_1100])
-                shares_first        = shares // 2
-                shares_second       = shares - shares_first
-                pnl                 = (shares_first  * (x945  - ep) +
-                                       shares_second * (x1100 - ep))
-                blended_exit        = (x945 + x1100) / 2
-                ret_pct             = (blended_exit - ep) / ep * 100
-                exit_detail         = {
-                    "exit_945":          round(x945,   4),
-                    "exit_1100":         round(x1100,  4),
-                    "blended_exit":      round(blended_exit, 4),
-                    "shares_first":      shares_first,
-                    "shares_second":     shares_second,
-                    "exit_price":        round(blended_exit, 4),
-                }
-            else:
-                xp          = float(row[exit_col_or_cols])
-                pnl         = shares * (xp - ep)
-                ret_pct     = (xp - ep) / ep * 100
-                exit_detail = {"exit_price": round(xp, 4)}
+            leg2_exit = np.nan
+            sl_hit    = False
 
-            # Enriched diagnostics pulled from diagnostic table
-            o915  = row.get("today_open_915",   np.nan)
-            c1515 = row.get("today_close_1515", np.nan)
-            ed_h  = row.get("today_high",       np.nan)
-            nd_h  = row.get("next_day_high",    np.nan)
-            nd_o  = row.get("next_day_open_915",np.nan)
-            nd_c  = row.get("next_day_close_1515", np.nan)
+            for _, c in scan.iterrows():
+                c_date = c["date"]; c_hm = int(c["hm"])
+                # At or past 15:00 on next day → use open as fallback
+                if c_date == next_date and c_hm >= HM_1500:
+                    leg2_exit = float(c["open"])
+                    break
+                if float(c["low"]) <= sl_price:
+                    leg2_exit = sl_price
+                    sl_hit    = True
+                    break
 
-            def _pct(a, b):
-                return round((a - b) / b * 100, 4) if (
-                    pd.notna(a) and pd.notna(b) and b != 0) else np.nan
+            if np.isnan(leg2_exit):
+                if not np.isnan(fallback_3pm):
+                    leg2_exit = fallback_3pm
+                else:
+                    continue
 
-            TAGS = [("10",0),("11",0),("12",0),("13",0),("14",0),("15",0)]
+            all_rows.append({
+                "entry_date": entry_date,
+                "symbol":     symbol,
+                "ep":         ep,
+                "x945":       x945,
+                "leg2":       leg2_exit,
+                "sl_hit":     sl_hit,
+                "row":        row,
+            })
 
-            r = {
-                "date":               entry_date,
-                "symbol":             row["symbol"],
-                "entry_price":        round(ep, 4),
-                "shares_bought":      shares,
-                "target_allocation":  round(target, 2),
-                "capital_allocated":  round(actual_cap, 2),
-                "pnl":                round(pnl, 2),
-                "return_pct":         round(ret_pct, 4),
-                "n_signals_day":      n,
-                **exit_detail,
-                "prev_day_vwap_close_used": round(float(row["prev_day_vwap_close"]), 4),
-                "vol_ratio":          round(float(row["volume_ratio"]), 2),
-                "mcap_cr":            round(float(row["market_cap_value"]), 1),
-                "pre_entry_move_pct":     _pct(ep,   o915),
-                "post_entry_move_pct":    _pct(c1515, ep),
-                "entry_day_open_915":     round(float(o915),  4) if pd.notna(o915)  else np.nan,
-                "entry_day_close_1515":   round(float(c1515), 4) if pd.notna(c1515) else np.nan,
-                "entry_day_high_price":   round(float(ed_h),  4) if pd.notna(ed_h)  else np.nan,
-                "entry_day_high_time":    row.get("today_high_time", ""),
-                "entry_day_low_price":    round(float(row.get("today_low", np.nan)), 4) if pd.notna(row.get("today_low")) else np.nan,
-                "entry_day_low_time":     row.get("today_low_time", ""),
-                "exit_day_high_price":    round(float(nd_h),  4) if pd.notna(nd_h)  else np.nan,
-                "exit_day_high_time":     row.get("next_day_high_time", ""),
-                "exit_day_low_price":     round(float(row.get("next_day_low", np.nan)), 4) if pd.notna(row.get("next_day_low")) else np.nan,
-                "exit_day_low_time":      row.get("next_day_low_time", ""),
-                "entry_day_range_h_minus_o_pct": _pct(ed_h,  o915),
-                "entry_day_range_c_minus_o_pct": _pct(c1515, o915),
-                "exit_day_range_h_minus_o_pct":  _pct(nd_h,  nd_o),
-                "exit_day_range_c_minus_o_pct":  _pct(nd_c,  nd_o),
-                **{f"entry_day_cumlow_{t}":  round(float(row[f"today_cumlow_{t}"]),  4) if pd.notna(row.get(f"today_cumlow_{t}"))  else np.nan for t, _ in TAGS},
-                **{f"entry_day_cumhigh_{t}": round(float(row[f"today_cumhigh_{t}"]), 4) if pd.notna(row.get(f"today_cumhigh_{t}")) else np.nan for t, _ in TAGS},
-                **{f"exit_day_cumlow_{t}":   round(float(row[f"next_day_cumlow_{t}"]),  4) if pd.notna(row.get(f"next_day_cumlow_{t}"))  else np.nan for t, _ in TAGS},
-                **{f"exit_day_cumhigh_{t}":  round(float(row[f"next_day_cumhigh_{t}"]), 4) if pd.notna(row.get(f"next_day_cumhigh_{t}")) else np.nan for t, _ in TAGS},
-            }
-            exec_rows.append(r)
+    # Now build trades with correct per-day sizing
+    by_date = defaultdict(list)
+    for item in all_rows:
+        by_date[item["entry_date"]].append(item)
 
-    trades = (pd.DataFrame(exec_rows)
-              .sort_values(["date", "symbol"])
-              .reset_index(drop=True))
-    if not trades.empty:
-        trades["date"] = pd.to_datetime(trades["date"])
-    return trades
+    rows = []
+    for d in sorted(by_date):
+        day = by_date[d]; n = len(day); tgt = _day_target(n)
+        for item in day:
+            ep   = item["ep"]; x945 = item["x945"]; leg2 = item["leg2"]
+            sh   = int(tgt // ep)
+            if sh == 0: continue
+            s1   = sh // 2; s2 = sh - s1
+            pnl  = s1 * (x945 - ep) + s2 * (leg2 - ep)
+            ret  = 0.5 * (x945 - ep) / ep * 100 + 0.5 * (leg2 - ep) / ep * 100
+            rows.append({
+                "date": d, "symbol": item["symbol"],
+                "entry": ep, "exit_945": x945, "exit_leg2": leg2,
+                "shares": sh, "pnl": pnl, "ret": ret,
+                "cap": sh * ep, "sl_hit": item["sl_hit"],
+            })
+
+    return pd.DataFrame(rows)
 
 
-def _compute_summary(trades, label):
-    """Compute summary stats for one trade set."""
+# ── Stats & reporting ─────────────────────────────────────────────────────────
+
+STARTING_EQUITY = 500_000   # ₹5L baseline for equity curve
+
+
+def compute_stats(trades):
+    """Return summary dict for a trade log."""
     if trades.empty:
-        return {
-            "combo": label, "total_trades": 0, "total_return_pct": 0,
-            "win_rate_pct": 0, "positive_trades": 0, "negative_trades": 0,
-            "avg_ret_per_trade_pct": 0, "median_ret_per_trade_pct": 0,
-        }
+        return dict(trades=0, total_ret_pct=0, total_pnl=0,
+                    win_rate=0, wins=0, losses=0,
+                    max_dd_pct=0, max_dd_rs=0,
+                    avg_ret=0, median_ret=0, sl_hits=0)
+
     daily = (trades.groupby("date")
-             .agg(capital_deployed=("capital_allocated", "sum"),
-                  total_pnl       =("pnl",              "sum"))
+             .agg(cap=("cap", "sum"), pnl=("pnl", "sum"))
              .reset_index())
-    daily["daily_return_pct"] = daily["total_pnl"] / daily["capital_deployed"] * 100
-    total_return = daily["daily_return_pct"].sum()
-    wins         = (trades["pnl"] > 0).sum()
-    return {
-        "combo":                  label,
-        "total_trades":           len(trades),
-        "total_return_pct":       round(total_return, 4),
-        "win_rate_pct":           round(wins / len(trades) * 100, 2),
-        "positive_trades":        int(wins),
-        "negative_trades":        int((trades["pnl"] <= 0).sum()),
-        "avg_ret_per_trade_pct":  round(trades["return_pct"].mean(), 4),
-        "median_ret_per_trade_pct": round(trades["return_pct"].median(), 4),
-    }
+    daily["dr"] = daily["pnl"] / daily["cap"] * 100
+
+    total_ret = daily["dr"].sum()
+
+    # Continuous equity curve (never reset)
+    cum_pnl   = daily["pnl"].cumsum()
+    equity    = STARTING_EQUITY + cum_pnl
+    peak      = equity.cummax()
+    dd_rs     = equity - peak
+    max_dd_rs = dd_rs.min()
+    max_dd_pct = (dd_rs / peak).min() * 100
+
+    wins   = int((trades["pnl"] > 0).sum())
+    losses = int((trades["pnl"] <= 0).sum())
+    sl_hits = int(trades["sl_hit"].sum()) if "sl_hit" in trades.columns else 0
+
+    return dict(
+        trades     = len(trades),
+        total_ret_pct = round(total_ret, 2),
+        total_pnl  = round(float(trades["pnl"].sum()), 0),
+        win_rate   = round(wins / len(trades) * 100, 2),
+        wins       = wins,
+        losses     = losses,
+        max_dd_pct = round(max_dd_pct, 2),
+        max_dd_rs  = round(max_dd_rs, 0),
+        avg_ret    = round(float(trades["ret"].mean()), 4),
+        median_ret = round(float(trades["ret"].median()), 4),
+        sl_hits    = sl_hits,
+    )
 
 
-def run_all_combos(diag_df, results_dir=None, save_trades=True, verbose=True):
-    """
-    Run all 10 entry × exit combinations.
-
-    Parameters
-    ----------
-    diag_df : pd.DataFrame
-        Full diagnostic table from build_diagnostic_table().
-    results_dir : Path or str, optional
-        Where to save trade CSVs. Defaults to results/.
-    save_trades : bool
-        Whether to write per-combination trade CSVs.
-    verbose : bool
-        Print progress.
-
-    Returns
-    -------
-    summary_df : pd.DataFrame
-        10-row comparison table.
-    trades_dict : dict
-        {file_label: trades_df} for each of the 8 unique combinations.
-    """
-    out_dir = Path(results_dir) if results_dir else RESULTS_DIR
-    out_dir.mkdir(exist_ok=True)
-
-    signals = diag_df[diag_df["passes_all_three"]].copy()
-    if verbose:
-        print(f"\n  passes_all_three signals: {len(signals):,}")
-
-    # Run each unique combination once
-    computed = {}
-    for label, entry_col, exit_type, exit_cols, file_label in UNIQUE_COMBOS:
-        if verbose:
-            print(f"  Running: {label} …", end=" ", flush=True)
-        trades = run_single_backtest(signals, entry_col, exit_type, exit_cols)
-        computed[file_label] = trades
-        if save_trades and not trades.empty:
-            path = out_dir / f"trades_{file_label}.csv"
-            trades.to_csv(path, index=False)
-        if verbose:
-            print(f"{len(trades):,} trades")
-
-    # Build 10-row summary (COMBOS order, with 3pm exit repeated for each entry)
-    summary_rows = []
-    for label, entry_col, exit_type, exit_cols, file_label in COMBOS:
-        trades = computed[file_label]
-        summary_rows.append(_compute_summary(trades, label))
-
-    summary_df = pd.DataFrame(summary_rows)
-    if save_trades:
-        summary_df.to_csv(out_dir / "summary.csv", index=False)
-
-    return summary_df, computed
+def make_daily_table(trades):
+    if trades.empty:
+        return pd.DataFrame()
+    daily = (trades.groupby("date")
+             .agg(n_trades=("pnl", "count"),
+                  pnl=("pnl", "sum"),
+                  cap=("cap", "sum"))
+             .reset_index())
+    daily["return_pct"]  = (daily["pnl"] / daily["cap"] * 100).round(4)
+    daily["cum_pnl"]     = daily["pnl"].cumsum().round(0)
+    daily["equity"]      = (STARTING_EQUITY + daily["cum_pnl"]).round(0)
+    return daily.sort_values("date").reset_index(drop=True)
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+def make_monthly_table(trades):
+    if trades.empty:
+        return pd.DataFrame()
+    t = trades.copy()
+    t["year_month"] = pd.to_datetime(t["date"]).dt.to_period("M")
+    monthly = (t.groupby("year_month")
+               .agg(n_trades=("pnl", "count"),
+                    pnl=("pnl", "sum"),
+                    cap=("cap", "sum"))
+               .reset_index())
+    monthly["return_pct"] = (monthly["pnl"] / monthly["cap"] * 100).round(4)
+    monthly["cum_pnl"]    = monthly["pnl"].cumsum().round(0)
+    return monthly.sort_values("year_month").reset_index(drop=True)
+
+
+def make_yearly_table(trades):
+    if trades.empty:
+        return pd.DataFrame()
+    t = trades.copy()
+    t["year"] = pd.to_datetime(t["date"]).dt.year
+    yearly = (t.groupby("year")
+              .agg(n_trades=("pnl", "count"),
+                   pnl=("pnl", "sum"),
+                   cap=("cap", "sum"))
+              .reset_index())
+    yearly["return_pct"] = (yearly["pnl"] / yearly["cap"] * 100).round(4)
+    return yearly.sort_values("year").reset_index(drop=True)
+
+
+def save_excel(scenario_results, out_path):
+    """Write all scenario results to a multi-sheet Excel file."""
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        for name, trades in scenario_results.items():
+            safe = name[:31]
+            if not trades.empty:
+                trades.to_excel(writer, sheet_name=f"{safe} trades", index=False)
+            make_daily_table(trades).to_excel(
+                writer, sheet_name=f"{safe} daily",   index=False)
+            make_monthly_table(trades).to_excel(
+                writer, sheet_name=f"{safe} monthly", index=False)
+            make_yearly_table(trades).to_excel(
+                writer, sheet_name=f"{safe} yearly",  index=False)
+
+        # Auto-width
+        for sheet in writer.sheets.values():
+            for col in sheet.columns:
+                max_len = max(
+                    (len(str(c.value)) for c in col if c.value is not None), default=10)
+                sheet.column_dimensions[col[0].column_letter].width = min(max_len + 2, 28)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run all 10 entry×exit backtests from a diagnostic table")
-    parser.add_argument("--diag", type=str,
-                        default=str(RESULTS_DIR / "diagnostic_table.csv"),
-                        help="Path to diagnostic_table.csv")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--diag", default="results/diagnostic_table.csv")
+    parser.add_argument("--three-conditions", action="store_true",
+                        help="Filter on passes_all_three (no fade filter)")
     args = parser.parse_args()
 
-    diag_path = Path(args.diag)
+    diag_path = BASE / args.diag
     if not diag_path.exists():
-        print(f"ERROR: diagnostic table not found: {diag_path}")
-        print("Run prepare_data.py first.")
-        raise SystemExit(1)
+        print(f"ERROR: {diag_path} not found — run prepare_data.py first.")
+        sys.exit(1)
 
-    print("=" * 72)
-    print("run_backtest.py  —  10 entry × exit combinations")
-    print(f"Reading  : {diag_path}")
-    print(f"Output   : {RESULTS_DIR}/")
-    print("=" * 72)
-
-    print(f"\nLoading diagnostic table …")
+    print(f"Loading {diag_path} …")
     diag = pd.read_csv(diag_path, parse_dates=["date"])
-    print(f"  {len(diag):,} rows  |  {diag['symbol'].nunique():,} symbols")
-    print(f"  passes_all_three=True: {diag['passes_all_three'].sum():,}")
 
-    print("\nRunning combinations:")
-    summary, trades_dict = run_all_combos(diag, verbose=True)
+    # ── Validation: show 3-condition baseline first ───────────────────────────
+    sig3 = diag[diag["passes_all_three"]].copy()
+    print(f"\n  3-condition signals : {len(sig3):,}")
 
-    print("\n" + "=" * 72)
-    print(f"{'#':>2}  {'Entry / Exit Combo':<40}  {'Trades':>7}  "
-          f"{'Total%':>9}  {'WinRate':>8}  {'Avg%':>8}  {'Med%':>8}")
-    print("    " + "─" * 68)
-    for i, row in summary.iterrows():
-        print(f"{i+1:>2}  {row['combo']:<40}  {int(row['total_trades']):>7,}  "
-              f"{row['total_return_pct']:>+9.2f}  {row['win_rate_pct']:>7.2f}%  "
-              f"{row['avg_ret_per_trade_pct']:>+8.4f}  {row['median_ret_per_trade_pct']:>+8.4f}")
+    t_std3  = run_standard(sig3)
+    s_std3  = compute_stats(t_std3)
+    t_spl3  = run_split(sig3)
+    s_spl3  = compute_stats(t_spl3)
+
+    print()
     print("=" * 72)
-    print(f"\nTrade files + summary saved to {RESULTS_DIR}/")
+    print("  VALIDATION — Original 3 conditions (no fade filter)")
+    print("  Expected: 3,497 trades, split exit +787.85%")
+    print("=" * 72)
+    print(f"  {'Scenario':<28}  {'Trades':>7}  {'Total%':>9}  {'Win%':>7}  {'Avg%':>8}")
+    print("  " + "─" * 60)
+    print(f"  {'Standard (3pm exit)':<28}  {s_std3['trades']:>7,}  "
+          f"{s_std3['total_ret_pct']:>+9.2f}  {s_std3['win_rate']:>7.2f}  "
+          f"{s_std3['avg_ret']:>+8.4f}")
+    print(f"  {'Split (9:45+11am)':<28}  {s_spl3['trades']:>7,}  "
+          f"{s_spl3['total_ret_pct']:>+9.2f}  {s_spl3['win_rate']:>7.2f}  "
+          f"{s_spl3['avg_ret']:>+8.4f}")
+
+    match = "✓  MATCH" if s_spl3["trades"] == 3497 and abs(s_spl3["total_ret_pct"] - 787.85) < 0.1 else "✗  MISMATCH"
+    print(f"\n  Validation: {match}")
+
+    # ── Main backtest: 4 conditions ───────────────────────────────────────────
+    condition_col = "passes_all_three" if args.three_conditions else "passes_all_four"
+    label         = "3 conditions" if args.three_conditions else "4 conditions (+ fade ≤5%)"
+    signals       = diag[diag[condition_col]].copy()
+    print(f"\n  4-condition signals : {len(signals):,}")
+
+    print(f"\nRunning 3 scenarios on {label} …")
+
+    t0 = time.time()
+    t_std  = run_standard(signals)
+    t_spl  = run_split(signals)
+    print("  Standard + Split done. Running Split+SL (needs parquet scan) …")
+    t_sl   = run_split_sl(signals)
+    elapsed = time.time() - t0
+
+    s_std  = compute_stats(t_std)
+    s_spl  = compute_stats(t_spl)
+    s_sl   = compute_stats(t_sl)
+
+    sl_n    = int(t_sl["sl_hit"].sum()) if not t_sl.empty else 0
+    sl_pct  = sl_n / len(t_sl) * 100 if not t_sl.empty else 0
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print()
+    print("=" * 90)
+    print(f"  RESULTS — {label}  |  Entry 3:15pm")
+    print("=" * 90)
+    hdr = f"  {'Scenario':<28}  {'Trades':>7}  {'Total%':>9}  {'Win%':>7}  {'Avg%':>8}  {'MaxDD%':>8}  {'MaxDD₹':>10}  {'SL hits':>9}"
+    print(hdr)
+    print("  " + "─" * 86)
+
+    def row(label, s, sl_info="N/A"):
+        return (f"  {label:<28}  {s['trades']:>7,}  "
+                f"{s['total_ret_pct']:>+9.2f}  {s['win_rate']:>7.2f}  "
+                f"{s['avg_ret']:>+8.4f}  {s['max_dd_pct']:>+8.2f}  "
+                f"{s['max_dd_rs']:>+10,.0f}  {sl_info:>9}")
+
+    print(row("Standard (3pm exit)",      s_std))
+    print(row("Split (9:45+11am)",         s_spl))
+    print(row("Split+SL5% (fallback 3pm)", s_sl,
+              f"{sl_n} ({sl_pct:.1f}%)"))
+    print("  " + "─" * 86)
+    print()
+
+    # ── Impact of adding fade filter ──────────────────────────────────────────
+    if not args.three_conditions:
+        sig3_spl = s_spl3
+        sig4_spl = s_spl
+        removed  = len(sig3) - len(signals)
+        print("  FADE FILTER IMPACT (split exit, 3 → 4 conditions):")
+        print(f"  {'':28}  {'3 conditions':>14}  {'4 conditions':>14}")
+        print(f"  {'Signals':28}  {len(sig3):>14,}  {len(signals):>14,}")
+        print(f"  {'Trades':28}  {sig3_spl['trades']:>14,}  {sig4_spl['trades']:>14,}")
+        print(f"  {'Total return %':28}  {sig3_spl['total_ret_pct']:>+14.2f}  {sig4_spl['total_ret_pct']:>+14.2f}")
+        print(f"  {'Max drawdown %':28}  {sig3_spl['max_dd_pct']:>+14.2f}  {sig4_spl['max_dd_pct']:>+14.2f}")
+        print(f"  {'Win rate %':28}  {sig3_spl['win_rate']:>14.2f}  {sig4_spl['win_rate']:>14.2f}")
+        print(f"  Signals removed by fade filter: {removed:,} ({removed/len(sig3)*100:.1f}%)")
+        print()
+
+    # ── Save Excel ────────────────────────────────────────────────────────────
+    RESULTS.mkdir(exist_ok=True)
+    out_path = RESULTS / "backtest_results.xlsx"
+    scenario_results = {
+        "1_Standard":  t_std,
+        "2_Split":     t_spl,
+        "3_SplitSL5":  t_sl,
+    }
+    save_excel(scenario_results, out_path)
+    print(f"  Results saved → {out_path}")
+    print(f"  Runtime: {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
