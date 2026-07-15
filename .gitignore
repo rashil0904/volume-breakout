@@ -13,3 +13,6 @@ results/.Rhistory
 
 # Daily pipeline logs (auto-generated, not version-controlled)
 logs/*.log
+
+# Daily market cap exports (auto-fetched, not version-controlled)
+market_cap_daily/

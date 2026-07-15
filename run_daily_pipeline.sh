@@ -2,7 +2,7 @@
 # =============================================================================
 # run_daily_pipeline.sh — NSE Volume Breakout: daily data pipeline
 # =============================================================================
-# Chain: data_loading.py → prepare_data.py
+# Chain: fetch_market_cap.py → data_loading.py → prepare_data.py
 # Triggered by launchd at BOTH 04:31 ET and 05:31 ET:
 #
 #   04:31 ET = 09:31 UTC = 15:01 IST  during EST (Nov  1 – Mar  8)
@@ -140,39 +140,58 @@ log "============================================================"
 # Track pipeline outcome so notify.py always runs, even on failure.
 PIPELINE_STATUS="failed"
 FAILED_STEP=""
+MCAP_STATUS="fresh"
 PIPELINE_START_TS=$(date +%s)
 
-# ── Step 4: data_loading.py ───────────────────────────────────────────────────
-log "--- STEP 1/2: data_loading.py ---"
+# ── Step 4: fetch_market_cap.py ───────────────────────────────────────────────
+# Exit 0 = fresh data; 2 = stale fallback (proceed with warning); 1 = no file at all.
+# Pipeline always continues — mcap failure never blocks data_loading.py.
+log "--- STEP 1/3: fetch_market_cap.py ---"
 cd "$PROJECT_DIR"
+
+"$PYTHON" fetch_market_cap.py >> "$LOG_FILE" 2>&1
+MCAP_EXIT=$?
+
+if [[ $MCAP_EXIT -eq 2 ]]; then
+    MCAP_STATUS="stale"
+    log "STEP 1/3: Market cap fetch FAILED — using stale fallback. Continuing."
+elif [[ $MCAP_EXIT -eq 1 ]]; then
+    MCAP_STATUS="failed"
+    log "STEP 1/3: Market cap fetch FAILED — no fallback. prepare_data.py will use snapshots."
+else
+    log "--- STEP 1/3 COMPLETE: fetch_market_cap.py succeeded ---"
+fi
+
+# ── Step 5: data_loading.py ───────────────────────────────────────────────────
+log "--- STEP 2/3: data_loading.py ---"
 
 "$PYTHON" data_loading.py >> "$LOG_FILE" 2>&1
 DL_EXIT=$?
 
 if [[ $DL_EXIT -ne 0 ]]; then
-    log "STEP 1/2 FAILED  (exit code: ${DL_EXIT})"
+    log "STEP 2/3 FAILED  (exit code: ${DL_EXIT})"
     log "  prepare_data.py will NOT run — data fetch was incomplete."
     log "  To retry manually:"
     log "    cd '${PROJECT_DIR}'"
-    log "    python3 data_loading.py && python3 prepare_data.py"
+    log "    python3 fetch_market_cap.py && python3 data_loading.py && python3 prepare_data.py"
     FAILED_STEP="data_loading.py"
 else
-    log "--- STEP 1/2 COMPLETE: data_loading.py succeeded ---"
+    log "--- STEP 2/3 COMPLETE: data_loading.py succeeded ---"
 
-    # ── Step 5: prepare_data.py ───────────────────────────────────────────────
-    log "--- STEP 2/2: prepare_data.py ---"
+    # ── Step 6: prepare_data.py ───────────────────────────────────────────────
+    log "--- STEP 3/3: prepare_data.py ---"
 
     "$PYTHON" prepare_data.py >> "$LOG_FILE" 2>&1
     PD_EXIT=$?
 
     if [[ $PD_EXIT -ne 0 ]]; then
-        log "STEP 2/2 FAILED  (exit code: ${PD_EXIT})"
+        log "STEP 3/3 FAILED  (exit code: ${PD_EXIT})"
         log "  To retry manually (data fetch was OK, only analysis failed):"
         log "    cd '${PROJECT_DIR}'"
         log "    python3 prepare_data.py"
         FAILED_STEP="prepare_data.py"
     else
-        log "--- STEP 2/2 COMPLETE: prepare_data.py succeeded ---"
+        log "--- STEP 3/3 COMPLETE: prepare_data.py succeeded ---"
         PIPELINE_STATUS="success"
         log "============================================================"
         log "PIPELINE COMPLETE."
@@ -182,7 +201,7 @@ else
     fi
 fi
 
-# ── Step 6: Email notification (always runs, even after failure) ──────────────
+# ── Step 7: Email notification (always runs, even after failure) ──────────────
 log "--- Sending notification email ---"
 NOTIFY_EXIT=0
 "$PYTHON" "${PROJECT_DIR}/notify.py" \
@@ -190,6 +209,7 @@ NOTIFY_EXIT=0
     --date         "$TODAY_IST"          \
     --status       "$PIPELINE_STATUS"    \
     --failed-step  "$FAILED_STEP"        \
+    --mcap-status  "$MCAP_STATUS"        \
     --start-ts     "$PIPELINE_START_TS"  \
     >> "$LOG_FILE" 2>&1 || NOTIFY_EXIT=$?
 

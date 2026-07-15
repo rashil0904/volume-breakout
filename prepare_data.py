@@ -33,6 +33,7 @@ CLI:
 """
 
 import argparse
+import json
 import sys
 import time
 from bisect import bisect_right
@@ -41,10 +42,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-BASE       = Path(__file__).parent
-MASTER_DIR = BASE / "master_data"
-MDIR       = BASE / "mcap_cache"
-RESULTS    = BASE / "results"
+BASE           = Path(__file__).parent
+MASTER_DIR     = BASE / "master_data"
+MDIR           = BASE / "mcap_cache"
+RESULTS        = BASE / "results"
+MCAP_DAILY_DIR = BASE / "market_cap_daily"
 IST        = "Asia/Kolkata"
 
 HM_915  = 555   # 09:15
@@ -73,6 +75,57 @@ SNAPS = [
     ("2024-12-31", "mcap_2024-12-31.xlsx",  "Average MCAP_July2024ToDecember 2024 (1).xlsx"),
     ("2025-12-31", "mcap_2025-12-31.xlsx",  "Average_MCAP_July2025ToDecember2025_20260102201101.xlsx"),
 ]
+
+
+def _load_live_mcap():
+    """
+    Load today's live market cap from fetch_market_cap.py output.
+
+    Returns (mcap_dict, label) where:
+      mcap_dict — {SYMBOL: mcap_cr} for ALL stocks in the export, or None
+      label     — human-readable source string for log output
+
+    Used ONLY for today's trade list — historical backtest rows always use
+    the semi-annual snapshot data unchanged.
+    """
+    status_file = MCAP_DAILY_DIR / "mcap_status.json"
+    if not status_file.exists():
+        return None, "snapshot (no mcap_status.json)"
+
+    try:
+        st = json.loads(status_file.read_text())
+    except Exception as e:
+        print(f"  WARNING: Cannot read mcap_status.json: {e}")
+        return None, "snapshot (status file unreadable)"
+
+    # Ignore if status file is from a different day
+    today_str = pd.Timestamp.today().date().isoformat()
+    if st.get("date") != today_str:
+        return None, f"snapshot (mcap_status.json is from {st.get('date', '?')}, not today)"
+
+    if st.get("status") == "failed" or not st.get("file"):
+        return None, "snapshot (fetch_market_cap.py reported failed — no live file)"
+
+    csv_path = Path(st["file"])
+    if not csv_path.exists():
+        return None, f"snapshot (live file missing: {csv_path.name})"
+
+    try:
+        df = pd.read_csv(csv_path, dtype={"symbol": str})
+        df["symbol"] = df["symbol"].str.strip().str.upper()
+        df = df.dropna(subset=["mcap_cr"])
+        df = df[df["mcap_cr"] > 0]
+        mcap_dict = dict(zip(df["symbol"], df["mcap_cr"].astype(float)))
+        status = st.get("status", "fresh")
+        if status == "stale":
+            fallback = st.get("fallback_date", "?")
+            label = f"STALE Screener.in data from {fallback} (today's fetch failed)"
+        else:
+            label = f"live Screener.in ({today_str}, {len(mcap_dict):,} stocks)"
+        return mcap_dict, label
+    except Exception as e:
+        print(f"  WARNING: Cannot parse live mcap CSV ({csv_path.name}): {e}")
+        return None, "snapshot (live CSV parse error)"
 
 
 def _load_mcap_snapshots():
@@ -433,12 +486,42 @@ def build_diagnostic_table(vol_window=36, vol_mult=6.0,
 
     full_df = pd.concat(all_chunks, ignore_index=True)
 
+    # ── Load live market cap (today only — historical rows use snapshots) ─────
+    live_mcap, mcap_label = _load_live_mcap()
+
     # ── Write today's trade list ──────────────────────────────────────────────
     full_df["date"] = pd.to_datetime(full_df["date"])
     today_date = pd.Timestamp.today().normalize()
     today_signals = full_df[
         (full_df["date"] == today_date) & full_df["passes_all_three"]
     ].copy()
+
+    if live_mcap and not today_signals.empty:
+        # Map live mcap onto today's candidates
+        today_signals["_live"] = today_signals["symbol"].map(live_mcap)
+
+        # Exclude signals where live mcap is KNOWN to be outside 1,500–5,000 Cr.
+        # Signals whose symbol isn't in the export at all are kept (fallback to snapshot).
+        out_of_range = (
+            today_signals["_live"].notna() &
+            ~today_signals["_live"].between(MCAP_MIN_CR, MCAP_MAX_CR)
+        )
+        if out_of_range.any():
+            for _, row in today_signals.loc[out_of_range].iterrows():
+                print(f"  Live mcap filter: excluded {row['symbol']} "
+                      f"(₹{row['_live']:,.0f} Cr — outside ₹{MCAP_MIN_CR:,}–{MCAP_MAX_CR:,} Cr range)")
+        today_signals = today_signals[~out_of_range].copy()
+
+        # Update market_cap_value with live figure where available
+        has_live = today_signals["_live"].notna()
+        today_signals.loc[has_live, "market_cap_value"] = (
+            today_signals.loc[has_live, "_live"].round(2)
+        )
+        today_signals = today_signals.drop(columns=["_live"])
+        print(f"  Market cap source: {mcap_label}")
+    else:
+        if not live_mcap:
+            print(f"  Market cap source: {mcap_label}")
 
     trade_list_path = RESULTS / f"trade_list_{today_date.date()}.csv"
     cols = ["symbol", "date", "entry_price_315pm", "market_cap_value",
