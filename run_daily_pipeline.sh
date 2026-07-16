@@ -87,7 +87,7 @@ NSE_HOLIDAYS_2026=(
     "2026-04-03"   # Good Friday                    (Fri)
     "2026-05-01"   # Maharashtra Day / Labour Day   (Fri)
     "2026-06-26"   # Eid-ul-Adha (Id-Ul-Zuha)       (Fri)
-    "2026-07-17"   # Muharram                       (Fri)
+
     "2026-09-14"   # Ganesh Chaturthi               (Mon)
     "2026-10-02"   # Gandhi Jayanti                 (Fri)
     "2026-10-20"   # Dussehra                       (Tue)
