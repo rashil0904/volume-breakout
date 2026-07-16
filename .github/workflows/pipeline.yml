@@ -27,10 +27,10 @@ jobs:
         run: pip install -r requirements.txt
 
       # ── 3. Restore master_data + checkpoints cache ──────────────────────────
-      # These folders are in .gitignore — they hold ~1,600 parquet/CSV files
-      # built incrementally over time. Cache persists them between runs.
-      # First run will build from scratch (slow). All subsequent runs are fast.
+      # Cache persists parquet/CSV files between runs. On cache miss (first run
+      # or cache eviction), bootstrap from the GitHub Release asset instead.
       - name: Restore data cache
+        id: cache
         uses: actions/cache@v4
         with:
           path: |
@@ -39,6 +39,17 @@ jobs:
           key: nse-data-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             nse-data-${{ runner.os }}-
+
+      - name: Bootstrap master_data from release (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss — downloading master_data bootstrap from GitHub Release..."
+          curl -L -o master_data.tar.gz \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://github.com/rashil0904/volume-breakout/releases/download/master-data-bootstrap/master_data.tar.gz"
+          tar -xzf master_data.tar.gz
+          rm master_data.tar.gz
+          echo "Bootstrap complete. $(ls master_data/ | wc -l) parquet files loaded."
 
       # ── 4. Pipeline steps ───────────────────────────────────────────────────
       - name: "Step 1/3 — fetch_market_cap.py"
