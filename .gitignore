@@ -16,3 +16,6 @@ logs/*.log
 
 # Daily market cap exports (auto-fetched, not version-controlled)
 market_cap_daily/
+
+# Zerodha token cache (contains live access token, regenerated daily)
+Zerodha_Trade_Test/zerodha_token_cache.json
