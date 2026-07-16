@@ -17,6 +17,7 @@ Exit codes:
 import csv
 import io
 import json
+import os
 import re
 import sys
 import time
@@ -26,10 +27,9 @@ from pathlib import Path
 import requests
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-# ↓↓↓  FILL THESE IN BEFORE FIRST RUN  ↓↓↓
-SCREENER_EMAIL    = "rashilshah2@gmail.com"
-SCREENER_PASSWORD = "Universal@123"
-# ↑↑↑  never commit real credentials to git  ↑↑↑
+# Read from env vars (GitHub Actions secrets) with hardcoded fallback for local runs.
+SCREENER_EMAIL    = os.environ.get("SCREENER_EMAIL",    "rashilshah2@gmail.com")
+SCREENER_PASSWORD = os.environ.get("SCREENER_PASSWORD", "Universal@123")
 
 # Optional: if you have a saved Screener screen with the columns you want
 # (NSE Code, Market Capitalization, P/E …), paste its numeric ID here.

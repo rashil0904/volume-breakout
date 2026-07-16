@@ -24,6 +24,7 @@ import argparse
 import csv
 import html as html_lib
 import json
+import os
 import re
 import smtplib
 import sys
@@ -35,8 +36,9 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-SENDER_EMAIL        = "rashilshah2@gmail.com"
-SENDER_APP_PASSWORD = "bmvxiiajotkpkjvv"
+# Read from env vars (GitHub Actions secrets) with hardcoded fallback for local runs.
+SENDER_EMAIL        = os.environ.get("SENDER_EMAIL",        "rashilshah2@gmail.com")
+SENDER_APP_PASSWORD = os.environ.get("SENDER_APP_PASSWORD", "bmvxiiajotkpkjvv")
 RECIPIENT_EMAILS    = [
     "paramshah1510@gmail.com",
     "khannakartik145@gmail.com",
