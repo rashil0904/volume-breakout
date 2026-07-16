@@ -38,9 +38,9 @@ ACCESS_TOKEN   = os.environ.get(
     "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJEUjEyOTMiLCJqdGkiOiI2YTUxM2I4OGUzNDQ3MjQwMjRmNmQ5ODUiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlzRXh0ZW5kZWQiOnRydWUsImlhdCI6MTc4MzcwODU1MiwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxODE1MjU2ODAwfQ.b2kgnyorOf1XQgIiXyvZmRnu74rmMXlQ7jDbM2G2nHo"
 )
 COMPANIES_CSV  = "Companies List.csv"
-MAX_WORKERS    = 4
+MAX_WORKERS    = 8
 MAX_RETRIES    = 3
-INITIAL_BACKOFF = 2.0
+INITIAL_BACKOFF = 1.0
 
 BASE           = Path(__file__).parent
 CHECKPOINT_DIR = BASE / "checkpoints"

@@ -2,8 +2,8 @@ name: NSE Volume Breakout Pipeline
 
 on:
   schedule:
-    # 09:25 UTC = 14:55 IST — fires before the 15:00/15:15 IST entry window
-    - cron: '25 9 * * 1-5'
+    # 09:15 UTC = 14:45 IST — fires 30 min before the 15:15 IST entry window
+    - cron: '15 9 * * 1-5'
   workflow_dispatch:   # allows manual trigger from GitHub Actions tab
 
 jobs:
