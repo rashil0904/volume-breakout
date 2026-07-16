@@ -221,6 +221,13 @@ else
     log "Notification email sent."
 fi
 
+# ── Step 8: macOS desktop notification ───────────────────────────────────────
+if [[ "$PIPELINE_STATUS" == "success" ]]; then
+    osascript -e 'display notification "Signals ready — review email, then run zerodha_trade.py manually if you want to trade." with title "NSE Pipeline ✓" sound name "Glass"' 2>/dev/null || true
+else
+    osascript -e "display notification \"Pipeline FAILED at ${FAILED_STEP:-unknown step} — check log.\" with title \"NSE Pipeline ✗\" sound name \"Basso\"" 2>/dev/null || true
+fi
+
 # Exit with pipeline status so launchd records success vs failure correctly.
 if [[ "$PIPELINE_STATUS" == "failed" ]]; then
     exit 1
