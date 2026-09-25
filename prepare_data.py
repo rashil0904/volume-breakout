@@ -10,14 +10,16 @@ Reads master_data/*.parquet. Outputs:
   results/trade_list_YYYY-MM-DD.csv     — TODAY's signals only (3 conditions
                                           pass) — the live "buy these at 3:15pm" list
 
-Signal conditions (all 4 must pass):
+Signal conditions (3 must pass; data = 1-min candles):
   1. Market cap ₹1,500–5,000 Cr (nearest preceding NSE semi-annual snapshot)
-  2. Cumulative volume 09:15–14:45 >= vol_mult × N-day rolling avg full-day volume
-       (full-day = 09:15–15:15; zero-vol days excluded; strict min_periods=N)
+  2. Cumulative volume 09:15–14:59 (all 1-min bars, inclusive) >= vol_mult ×
+       N-day rolling avg full-day volume
+       (full-day = 09:15–15:29 = all 1-min bars; zero-vol days excluded; strict min_periods=N)
   3. OPEN of 15:00 candle >= 5% above prev_day_vwap_close
-       (prev_day_vwap = VWAP of prev day's 15:00+15:15 candles,
+       (prev_day_vwap = VWAP of prev day's LAST 30 one-min candles, 15:00–15:29;
         typical_price = (H+L+C)/3 per candle, volume-weighted)
-  4. Fade-at-entry <= 5% (NO LOOKAHEAD):
+  [4. Fade-at-entry filter — DISABLED (see passes_all_four = passes_all_three).]
+     Fade-at-entry <= 5% (NO LOOKAHEAD):
        high_before_entry = MAX(high) from 09:15 through 15:00 inclusive
                            (15:00 candle closes exactly when 15:15 candle opens
                             — fully known at entry time, zero lookahead)
@@ -55,6 +57,14 @@ HM_1430 = 870   # 14:30
 HM_1445 = 885   # 14:45
 HM_1500 = 900   # 15:00
 HM_1515 = 915   # 15:15
+HM_1459 = 899   # 14:59  (last 1-min candle before the 15:00 entry-reference window)
+HM_1529 = 929   # 15:29  (final 1-min session candle — session end)
+
+# ── 1-MIN timing conventions (parameterized; data moved 15-min → 1-min) ───────
+VOL_CUTOFF_HM  = HM_1459    # CHANGE 1: entry-day cumulative volume = 09:15 → 14:59 inclusive
+VWAP_WIN_START = HM_1500    # CHANGE 2: VWAP-close = last 30 one-min candles (15:00 → 15:29)
+VWAP_WIN_END   = HM_1529
+FULLDAY_END_HM = HM_1529    # CHANGE 3: 36-day avg denominator = full-day volume 09:15 → 15:29
 
 MCAP_MIN_CR = 1_500
 MCAP_MAX_CR = 5_000
@@ -182,19 +192,21 @@ def build_diagnostic_table(vol_window=36, vol_mult=6.0,
         if len(all_dates) < vol_window + 1:
             continue
 
-        # ── Per-day volume aggregates ─────────────────────────────────────────
-        fd_vol = (raw[(raw["hm"] >= HM_915) & (raw["hm"] <= HM_1515)]
+        # ── Per-day volume aggregates (1-min) ─────────────────────────────────
+        # CHANGE 3: full-day volume = ALL 1-min candles 09:15 → 15:29 (session total)
+        fd_vol = (raw[(raw["hm"] >= HM_915) & (raw["hm"] <= FULLDAY_END_HM)]
                   .groupby("date")["volume"].sum())
-        c3_vol = (raw[(raw["hm"] >= HM_915) & (raw["hm"] <= HM_1445)]
+        # CHANGE 1: entry-day "volume so far" = ALL 1-min candles 09:15 → 14:59 inclusive
+        c3_vol = (raw[(raw["hm"] >= HM_915) & (raw["hm"] <= VOL_CUTOFF_HM)]
                   .groupby("date")["volume"].sum())
 
-        # ── VWAP of previous day's last two candles ───────────────────────────
-        last2 = raw[raw["hm"].isin([HM_1500, HM_1515])].copy()
-        last2["tp"]     = (last2["high"] + last2["low"] + last2["close"]) / 3
-        last2["tp_vol"] = last2["tp"] * last2["volume"]
-        last2_grp = last2.groupby("date")[["tp_vol", "volume"]].sum()
-        vwap_raw  = (last2_grp["tp_vol"] / last2_grp["volume"]).where(
-                        last2_grp["volume"] > 0, np.nan)
+        # ── CHANGE 2: VWAP-close = last 30 one-min candles (15:00 → 15:29) ─────
+        last30 = raw[(raw["hm"] >= VWAP_WIN_START) & (raw["hm"] <= VWAP_WIN_END)].copy()
+        last30["tp"]     = (last30["high"] + last30["low"] + last30["close"]) / 3
+        last30["tp_vol"] = last30["tp"] * last30["volume"]
+        last30_grp = last30.groupby("date")[["tp_vol", "volume"]].sum()
+        vwap_raw  = (last30_grp["tp_vol"] / last30_grp["volume"]).where(
+                        last30_grp["volume"] > 0, np.nan)
 
         # ── 15:00 open (return condition reference price) ─────────────────────
         pm3_raw = raw[raw["hm"] == HM_1500].groupby("date")["open"].last()
@@ -345,7 +357,9 @@ def build_diagnostic_table(vol_window=36, vol_mult=6.0,
         passes_ret    = np.where(np.isnan(ret_arr),  False, ret_arr  >= 5.0)
         passes_fade   = np.where(np.isnan(fade_arr), False, fade_arr <= FADE_LIMIT)
         passes_three  = passes_vol & passes_ret          # original 3 conditions
-        passes_four   = passes_three & passes_fade       # all 4 conditions
+        # 4th (fade ≤5%) filter DISABLED — strategy uses only the 3 conditions.
+        # passes_all_four is kept as an alias of passes_all_three for backward compatibility.
+        passes_four   = passes_three.copy()
 
         hm_high_vals     = sym_df["hm_high"].values
         hm_low_vals      = sym_df["hm_low"].values

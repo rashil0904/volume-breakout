@@ -1,0 +1,176 @@
+# -*- coding: utf-8 -*-
+"""audit_fullchain_sensex_dense.py — THOROUGH read-only verification of the DENSIFIED full-chain SENSEX
+dataset (mirrors audit_fullchain_nifty.py). Checks: (1) structural (all API expiries present; CE/PE both
+sides; disk+empty == API count); (2) per-contract candle completeness (every active regular-session day ==
+375 rows post-densify; whole missing trading days = genuine gaps; special short sessions surface as recurring
+short-day dates); (3) field sanity (nulls; OHLC validity; REAL zero-vol rows must be O=H=L=C; DTE==calendar
+recompute; min DTE reaching 0; duplicate timestamps; is_synthetic present); (4) expiry weekday vs derived
+SENSEX regimes; (5) spot-vs-strike sanity. Report only, no modify. BSE calendar == NSE.
+"""
+import sys, time, glob, json
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+import requests, numpy as np, pandas as pd
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import run_backtest as rb, data_loading as dl
+
+ROOT = rb.BASE / "data" / "options_intraday_full" / "SENSEX"
+MAN = ROOT.parent / "manifest_sensex.csv"; ISS = ROOT.parent / "issues_sensex.csv"
+OUTDIR = rb.RESULTS / "fullchain_audit_sensex"; PARTS = OUTDIR / "parts_dense"; PARTS.mkdir(parents=True, exist_ok=True)
+DAILY = rb.BASE / "data" / "daily_ohlcv_all.parquet"
+UND = "BSE_INDEX|SENSEX"; FLOOR, CUTOFF = "2024-10-01", "2026-07-31"; FULL = 375
+H = {"Accept": "application/json", "Authorization": f"Bearer {dl.ACCESS_TOKEN}"}
+WD = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]; CUT_D = pd.Timestamp(CUTOFF).date()
+BASE = "https://api.upstox.com/v2/expired-instruments"; enc = lambda k: k.replace("|", "%7C")
+SPECIAL_SHORT = {"2025-10-21", "2024-11-01"}      # known BSE Muhurat sessions (legit short/evening)
+
+
+def get(u):
+    for a in range(4):
+        try: r = requests.get(u, headers=H, timeout=30)
+        except Exception: time.sleep(1.2 * (a + 1)); continue
+        if r.status_code == 200:
+            d = r.json().get("data", []); return d.get("candles", []) if isinstance(d, dict) else d
+        if r.status_code in (429, 500, 502, 503): time.sleep(1.2 * (a + 1)); continue
+        return None
+    return None
+
+
+def expected_wd(e):
+    if e <= "2025-01-06": return {"Fri", "Thu", "Wed"}
+    if e <= "2025-09-03": return {"Tue", "Mon", "Wed"}
+    return {"Thu", "Wed", "Fri"}
+
+
+def audit_expiry(exp, files, tdarr):
+    X = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+    ts = X["timestamp"].values.astype("datetime64[m]"); date = ts.astype("datetime64[D]"); minute = ts.astype("int64") % 1440
+    X["date"] = date; X["minute"] = minute
+    exp_dte = (np.datetime64(exp) - date).astype("timedelta64[D]").astype("int64")
+    X["null"] = X[["open", "high", "low", "close", "volume", "OI", "DTE"]].isna().any(axis=1)
+    X["ohlc_bad"] = (X.high < X.low) | (X.open < X.low) | (X.open > X.high) | (X.close < X.low) | (X.close > X.high)
+    X["dte_mis"] = X["DTE"].values != exp_dte
+    flat = (X.open == X.high) & (X.high == X.low) & (X.low == X.close)
+    syn = X.get("is_synthetic", pd.Series(False, index=X.index)).astype(bool)
+    X["zv_bad"] = (X.volume == 0) & (~syn) & (~flat)                # REAL zero-vol row with OHLC variation
+    X["no_syn_col"] = "is_synthetic" not in X.columns
+    daytime = (X.minute >= 555) & (X.minute <= 929)                # regular session only for the 375 check
+    g = X.groupby("symbol", sort=False)
+    per = g.agg(nnull=("null", "sum"), nbad=("ohlc_bad", "sum"), ndte=("dte_mis", "sum"), nzv=("zv_bad", "sum"),
+                min_dte=("DTE", "min"), strike=("strike", "first"), typ=("option_type", "first"),
+                nsyn=("is_synthetic", "sum") if "is_synthetic" in X.columns else ("null", "sum"), nrows=("close", "size"))
+    per["ndup"] = X.duplicated(["symbol", "timestamp"]).groupby(X["symbol"], sort=False).sum()
+    Xd = X[daytime]
+    cpd = Xd.groupby(["symbol", "date"], sort=False).size()        # REGULAR-session candles per contract-day
+    badday = cpd[cpd != FULL]
+    bd_by_sym = badday.groupby(level=0).size()
+    bad_dates = Counter(pd.to_datetime(badday.index.get_level_values(1)).date)
+    dates_by = g["date"].apply(lambda s: set(pd.to_datetime(s).dt.date))
+    fl = g["date"].agg(["min", "max"]); expd = pd.Timestamp(exp).date(); rows = []
+    for sym in per.index:
+        p = per.loc[sym]; fd = pd.Timestamp(fl.loc[sym, "min"]).date(); ld = pd.Timestamp(fl.loc[sym, "max"]).date()
+        window = [d for d in tdarr if fd <= d <= min(expd, CUT_D) and d <= ld]
+        miss = sorted(set(window) - dates_by.loc[sym]); fx = []
+        if p.nnull: fx.append(("null_fields", int(p.nnull)))
+        if p.nbad: fx.append(("ohlc_violation", int(p.nbad)))
+        if p.nzv: fx.append(("zero_vol_ohlc_inconsistent", int(p.nzv)))
+        if p.ndup: fx.append(("duplicate_timestamp", int(p.ndup)))
+        if p.ndte: fx.append(("dte_mismatch", int(p.ndte)))
+        if p.min_dte != 0: fx.append(("no_expiry_day_row", int(p.min_dte)))
+        # day_not_375 EXCLUDING known special short sessions
+        sym_bad = badday.loc[sym] if sym in bd_by_sym.index else None
+        if sym_bad is not None:
+            nbd = sum(1 for dt in pd.to_datetime(pd.Index([sym_bad]).get_level_values(0) if False else badday.loc[[sym]].index.get_level_values(1)) if str(dt.date()) not in SPECIAL_SHORT)
+            if nbd: fx.append(("day_not_375_rows(non-special)", int(nbd)))
+        if miss: fx.append(("missing_trading_days", len(miss)))
+        for it, det in fx:
+            rows.append({"symbol": sym, "expiry": exp, "strike": p.strike, "type": p.typ, "issue": it, "detail": str(det)})
+    ce = set(per[per.typ == "CE"].strike); pe = set(per[per.typ == "PE"].strike); struct = []
+    for s in sorted(ce - pe): struct.append({"expiry": exp, "issue": "one_sided_CE_only", "detail": f"strike {s}"})
+    for s in sorted(pe - ce): struct.append({"expiry": exp, "issue": "one_sided_PE_only", "detail": f"strike {s}"})
+    cnt = {"contracts": int(len(per)), "flagged": int(len(set(r["symbol"] for r in rows))), "rows": int(per.nrows.sum()),
+           "syn": int(per.nsyn.sum()) if "is_synthetic" in X.columns else 0, "zv_total": int((X.volume == 0).sum()),
+           "no_syn_col": int(X["no_syn_col"].any()), "struct": struct,
+           "short_dates": {str(k): int(v) for k, v in bad_dates.items()}}
+    return rows, cnt
+
+
+def main():
+    t0 = time.time()
+    d = pd.read_parquet(DAILY, columns=["date"]); tdarr = np.array(sorted(d["date"].dt.date.unique()))
+    exp_dirs = sorted([x for x in ROOT.iterdir() if x.is_dir()])
+    apiE = sorted([e for e in (get(f"{BASE}/expiries?instrument_key={enc(UND)}") or []) if FLOOR <= e <= CUTOFF])
+    present = [f"{x.name[:4]}-{x.name[4:6]}-{x.name[6:]}" for x in exp_dirs if any(x.glob("*.parquet"))]
+    struct = [{"expiry": e, "issue": "missing_expiry", "detail": "0 contracts"} for e in apiE if e not in present]
+    try:
+        emp = pd.read_csv(ISS); emp = emp[emp.issue == "empty_no_candles"].drop_duplicates(["expiry", "symbol"]).groupby("expiry").size().to_dict()
+    except Exception: emp = {}
+    print(f"structural: {len(apiE)} API expiries | present {len(present)} | missing {len(struct)}", flush=True)
+    for ei, x in enumerate(exp_dirs, 1):
+        e = f"{x.name[:4]}-{x.name[4:6]}-{x.name[6:]}"; part = PARTS / f"{x.name}.json"
+        if part.exists(): continue
+        files = sorted(glob.glob(str(x / "*.parquet")))
+        if not files:
+            json.dump({"rows": [], "cnt": {"contracts": 0, "flagged": 0, "rows": 0, "syn": 0, "zv_total": 0, "no_syn_col": 0, "struct": [], "short_dates": {}}}, open(part, "w")); continue
+        cons = get(f"{BASE}/option/contract?instrument_key={enc(UND)}&expiry_date={e}") or []
+        api_n = len(cons); disk_n = len(files); e_n = emp.get(e, 0); extra = []
+        if disk_n + e_n < api_n:
+            extra.append({"expiry": e, "issue": "pulled_lt_api", "detail": f"disk {disk_n}+empty {e_n} < api {api_n}"})
+        rows, cnt = audit_expiry(e, files, tdarr); cnt["struct"] += extra
+        json.dump({"rows": rows, "cnt": cnt}, open(part, "w"))
+        print(f"  [{ei}/{len(exp_dirs)}] {e} ({WD[datetime.strptime(e,'%Y-%m-%d').weekday()]}): {cnt['contracts']} contracts, {len(rows)} flags, {cnt['rows']:,} rows, syn {cnt['syn']:,} | {time.time()-t0:.0f}s", flush=True)
+
+    allrows = []; C = Counter(); struct_all = list(struct); short = Counter(); no_syn = 0
+    for p in sorted(PARTS.glob("*.json")):
+        j = json.load(open(p)); allrows += j["rows"]; c = j["cnt"]
+        for k in ("contracts", "rows", "syn", "zv_total"): C[k] += c.get(k, 0)
+        no_syn += c.get("no_syn_col", 0); struct_all += c.get("struct", [])
+        for dt, n in c.get("short_dates", {}).items(): short[dt] += n
+    I = pd.DataFrame(allrows); S = pd.DataFrame(struct_all)
+    by = I["issue"].value_counts().to_dict() if len(I) else {}
+    dows = [(e, WD[datetime.strptime(e, "%Y-%m-%d").weekday()]) for e in present]
+    anom = [(e, w) for e, w in dows if w not in expected_wd(e)]
+    nd = get(f"https://api.upstox.com/v2/historical-candle/{enc(UND)}/day/2026-07-31/2024-06-01") or []
+    ndf = pd.DataFrame(nd, columns=["ts", "o", "h", "l", "c", "v", "oi"]); ndf["date"] = pd.to_datetime(ndf.ts).dt.tz_localize(None).dt.date
+    ncl = dict(zip(ndf.date, ndf.c)); man = pd.read_csv(MAN); spot = []
+    if ncl:
+        for e, gg in man.groupby("expiry"):
+            ed = pd.Timestamp(e).date(); sp = ncl.get(ed) or ncl.get(min(ncl, key=lambda dd: abs((dd - ed).days)))
+            smin, smax = gg.strike.min(), gg.strike.max()
+            if not (smin <= sp <= smax): spot.append({"expiry": e, "spot": round(sp), "strike_min": smin, "strike_max": smax, "issue": "spot_outside_strike_range"})
+
+    summ = {"total_contracts": C["contracts"], "contracts_flagged": I["symbol"].nunique() if len(I) else 0,
+            "contracts_zero_issues": C["contracts"] - (I["symbol"].nunique() if len(I) else 0),
+            "total_rows_densified": C["rows"], "synthetic_rows": C["syn"], "synthetic_pct": round(C["syn"] / max(C["rows"], 1) * 100, 1),
+            "zero_volume_rows": C["zv_total"], "files_missing_is_synthetic": no_syn,
+            "expiries_present": len(present), "expiries_missing": len(struct),
+            "flag_missing_trading_days": by.get("missing_trading_days", 0),
+            "flag_day_not_375_nonspecial": by.get("day_not_375_rows(non-special)", 0),
+            "flag_no_expiry_day_row": by.get("no_expiry_day_row", 0), "flag_ohlc_violation": by.get("ohlc_violation", 0),
+            "flag_null_fields": by.get("null_fields", 0), "flag_zero_vol_ohlc_inconsistent": by.get("zero_vol_ohlc_inconsistent", 0),
+            "flag_dte_mismatch": by.get("dte_mismatch", 0), "flag_duplicate_timestamp": by.get("duplicate_timestamp", 0),
+            "one_sided_strikes": int(S.issue.str.startswith("one_sided").sum()) if len(S) else 0,
+            "pulled_lt_api_expiries": int((S.issue == "pulled_lt_api").sum()) if len(S) else 0,
+            "weekday_anomalies": len(anom), "spot_strike_anomalies": len(spot)}
+    with pd.ExcelWriter(OUTDIR / "fullchain_audit_sensex_dense.xlsx", engine="openpyxl") as w:
+        pd.DataFrame(list(summ.items()), columns=["metric", "value"]).to_excel(w, sheet_name="summary", index=False)
+        (S if len(S) else pd.DataFrame([{"note": "none"}])).to_excel(w, sheet_name="structural", index=False)
+        (I if len(I) else pd.DataFrame([{"note": "none"}])).to_excel(w, sheet_name="contract_issues", index=False)
+        pd.DataFrame([{"date": k, "contracts_short_day": v, "is_known_special": k in SPECIAL_SHORT} for k, v in sorted(short.items())]).to_excel(w, sheet_name="short_session_dates", index=False)
+        (pd.DataFrame(spot) if spot else pd.DataFrame([{"note": "all strike ranges bracket spot"}])).to_excel(w, sheet_name="spot_vs_strike", index=False)
+    if len(I): I.to_csv(OUTDIR / "flagged_contracts_dense.csv", index=False)
+
+    pd.set_option("display.width", 200)
+    print("\n" + "=" * 92 + "\nFULL-CHAIN SENSEX OPTIONS — THOROUGH VERIFICATION (densified)\n" + "=" * 92)
+    for k, v in summ.items(): print(f"  {k:34s}: {v:,}" if isinstance(v, int) else f"  {k:34s}: {v}")
+    print("\n--- contract issue counts ---"); print(I["issue"].value_counts().to_string() if len(I) else "  NONE")
+    print("\n--- short-day dates (candles != 375; recurring = special/short session) ---")
+    for dt, n in short.most_common(10): print(f"    {dt}: {n:,} contracts  {'[KNOWN SPECIAL]' if dt in SPECIAL_SHORT else '[!! investigate]'}")
+    print(f"\n  weekday anomalies: {anom if anom else 'NONE'}")
+    print(f"  files missing is_synthetic: {no_syn}")
+    print(f"\nSaved -> {OUTDIR} | {time.time()-t0:.0f}s")
+
+
+if __name__ == "__main__":
+    main()

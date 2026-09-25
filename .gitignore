@@ -7,9 +7,13 @@ __pycache__/
 .DS_Store
 .claude/
 
-# Large generated files (rebuild with prepare_data.py)
-results/diagnostic_table.csv
-results/.Rhistory
+# Large generated/pulled data and backtest outputs -- not version-controlled, stays local
+# (data/ holds raw options/futures/market-cap/trades pulls; results/ holds backtest outputs,
+# several individual files exceed GitHub's 100MB push limit)
+data/
+results/
+my_backtest_vol6_lb36_backup/
 
 # Daily pipeline logs (auto-generated, not version-controlled)
 logs/*.log
+*.log
