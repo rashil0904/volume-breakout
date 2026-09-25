@@ -17,3 +17,9 @@ my_backtest_vol6_lb36_backup/
 # Daily pipeline logs (auto-generated, not version-controlled)
 logs/*.log
 *.log
+
+# Daily market cap exports (auto-fetched, not version-controlled)
+market_cap_daily/
+
+# Zerodha token cache (contains live access token, regenerated daily)
+Zerodha_Trade_Test/zerodha_token_cache.json
